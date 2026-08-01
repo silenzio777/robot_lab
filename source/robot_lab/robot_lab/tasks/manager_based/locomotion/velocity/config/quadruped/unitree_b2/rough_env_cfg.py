@@ -14,7 +14,12 @@ from robot_lab.assets.unitree import UNITREE_B2_CFG  # isort: skip
 @configclass
 class UnitreeB2RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
     base_link_name = "base_link"
-    foot_link_name = ".*_foot"
+    # UNITREE_B2_CFG's UrdfFileCfg sets merge_fixed_joints=True, and B2's URDF connects the
+    # foot to the calf via a fixed joint -> the foot body gets absorbed into the calf on
+    # import, so there is no separately-named "*_foot" body (confirmed: resolved body list
+    # is [..., "FL_calf", ...], no foot entries). Use the calf as the foot-equivalent body
+    # for contact/gait reward terms instead.
+    foot_link_name = ".*_calf"
     # fmt: off
     joint_names = [
         "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
@@ -137,7 +142,7 @@ class UnitreeB2RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.feet_height_body.params["target_height"] = -0.4
         self.rewards.feet_height_body.params["asset_cfg"].body_names = [self.foot_link_name]
         self.rewards.feet_gait.weight = 0
-        self.rewards.feet_gait.params["synced_feet_pair_names"] = (("FL_foot", "RR_foot"), ("FR_foot", "RL_foot"))
+        self.rewards.feet_gait.params["synced_feet_pair_names"] = (("FL_calf", "RR_calf"), ("FR_calf", "RL_calf"))
         self.rewards.upward.weight = 3.0
 
         # If the weight of rewards is 0, set rewards to None
