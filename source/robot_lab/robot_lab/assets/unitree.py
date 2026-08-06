@@ -7,6 +7,24 @@ Reference: https://github.com/unitreerobotics/unitree_ros
 
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import DCMotorCfg, ImplicitActuatorCfg
+from isaaclab.actuators.actuator_pd import DCMotor, DelayedPDActuator
+from isaaclab.actuators.actuator_cfg import DelayedPDActuatorCfg
+from isaaclab.utils import configclass
+
+
+class DelayedDCMotor(DelayedPDActuator, DCMotor):
+    """DC motor with delayed command application -- IsaacLab ships the two halves
+    separately (DelayedPDActuator = delay buffers on the control targets, DCMotor =
+    torque-speed line saturation) and this class just stacks them via MRO:
+    DelayedPDActuator.compute() lags the targets through its buffers, then calls
+    super().compute(), which resolves to DCMotor.compute() and applies the speed-
+    dependent torque clip. Added 2026-08-05 for sim2real domain randomization:
+    action latency is the classic sim2real killer and the stack had none."""
+
+
+@configclass
+class DelayedDCMotorCfg(DelayedPDActuatorCfg, DCMotorCfg):
+    class_type: type = DelayedDCMotor
 from isaaclab.assets.articulation import ArticulationCfg
 
 from robot_lab.assets import ISAACLAB_ASSETS_DATA_DIR
@@ -218,33 +236,48 @@ UNITREE_B2_CFG = ArticulationCfg(
         joint_vel={".*": 0.0},
     ),
     soft_joint_pos_limit_factor=0.9,
+    # sim2real hardening 2026-08-05 (user-approved plan, see robot_stand's
+    # train_research/TRAIN_RESEARCH.md):
+    # - DelayedDCMotorCfg: same DC torque-speed line as before PLUS 0-4 physics
+    #   steps of randomized command latency per episode (the classic sim2real
+    #   killer; the stack previously modeled none).
+    # - effort_limit at 80% of the real motor (160/160/256 vs 200/200/320):
+    #   policies learn to solve the task with headroom, so the real robot never
+    #   needs to ride its true limits. saturation_effort stays REAL -- it defines
+    #   the physical torque-speed line, not the training budget.
     actuators={
-        "hip": DCMotorCfg(
+        "hip": DelayedDCMotorCfg(
             joint_names_expr=[".*_hip_joint"],
-            effort_limit=200.0,
+            effort_limit=160.0,
             saturation_effort=200.0,
             velocity_limit=23.0,
             stiffness=160.0,
             damping=5.0,
             friction=0.0,
+            min_delay=0,
+            max_delay=4,
         ),
-        "thigh": DCMotorCfg(
+        "thigh": DelayedDCMotorCfg(
             joint_names_expr=[".*_thigh_joint"],
-            effort_limit=200.0,
+            effort_limit=160.0,
             saturation_effort=200.0,
             velocity_limit=23.0,
             stiffness=160.0,
             damping=5.0,
             friction=0.0,
+            min_delay=0,
+            max_delay=4,
         ),
-        "calf": DCMotorCfg(
+        "calf": DelayedDCMotorCfg(
             joint_names_expr=[".*_calf_joint"],
-            effort_limit=320.0,
+            effort_limit=256.0,
             saturation_effort=320.0,
             velocity_limit=14.0,
             stiffness=160.0,
             damping=5.0,
             friction=0.0,
+            min_delay=0,
+            max_delay=4,
         ),
     },
 )
