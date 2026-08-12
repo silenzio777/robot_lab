@@ -69,6 +69,21 @@ class UnitreeB2RearStandPPORunnerCfg(UnitreeB2RoughPPORunnerCfg):
         # this run if desired (same recipe as crawl's own note above).
         self.experiment_name = "unitree_b2_rear_stand"
 
+        # entropy_coef 0.01 -> 0.005 (2026-08-10 night, autonomous fix under explicit
+        # nightly authorization): the v4 resume run (2026-08-10_03-35-39, from
+        # model_9000) hit a sustained action_rate_l2 instability at it18694-19894+ --
+        # 1200+ iterations, 86% with value_function loss >1000 (peak 15.6M, worst
+        # single iteration reward -137149) -- qualitatively different from every
+        # earlier spike that night (which self-resolved within 200-400 iterations).
+        # episode_length/orientation_tracking never degraded even at the worst point
+        # (same "isolated action_rate_l2 artifact, not real policy collapse" signature
+        # as jump 08-08), but the DURATION crossed into "not self-resolving on its
+        # own" territory. Same fix that solved it for jump (see
+        # UnitreeB2JumpPPORunnerCfg's own comment) -- calms noise_std, which reduces
+        # the extreme rare actions that trigger action_rate_l2's own unbounded blow-up.
+        # Rear_stand-only override -- doesn't touch rough/crawl/jump/vision.
+        self.algorithm.entropy_coef = 0.005
+
 
 @configclass
 class UnitreeB2JumpPPORunnerCfg(UnitreeB2RoughPPORunnerCfg):
@@ -79,6 +94,34 @@ class UnitreeB2JumpPPORunnerCfg(UnitreeB2RoughPPORunnerCfg):
         # own logs/rsl_rl/unitree_b2_jump/ directory, warm-started from the same
         # unitree_b2_rough walking checkpoint (see jump_env_cfg.py's own docstring).
         self.experiment_name = "unitree_b2_jump"
+
+        # entropy_coef 0.01 -> 0.005 (2026-08-08, overnight instability): noise_std
+        # climbed from ~1.6 to 2.2-2.9 over the night and never reconverged --
+        # unusually high and sustained for a task with a 1.0 init. A repeating
+        # pattern of action_rate_l2 blowing up (up to -1.2M on isolated iterations,
+        # occasionally correlating with REAL jump_direction_velocity/flight_distance
+        # degradation, not just log noise) tracked with these high-noise stretches.
+        # Halving the entropy bonus should let exploration settle instead of
+        # perpetually re-inflating after every improvement. Jump-only override --
+        # doesn't touch rough/crawl/rear_stand/vision's own entropy_coef.
+        self.algorithm.entropy_coef = 0.005
+
+
+@configclass
+class UnitreeB2LegLiftPPORunnerCfg(UnitreeB2RoughPPORunnerCfg):
+    def __post_init__(self):
+        super().__post_init__()
+
+        # Own logs/rsl_rl/unitree_b2_leg_lift/ directory; same network/obs/action
+        # shapes as the rough walking runner (leg_lift_env_cfg.py deliberately kept
+        # the command at 3 slots), so a walking checkpoint can warm-start this run if
+        # desired (same recipe as crawl/rear_stand's own note above).
+        self.experiment_name = "unitree_b2_leg_lift"
+        # 8000 -> 20000 (2026-08-11, first bench test: at 8000 only ONE of four legs
+        # (RR) had begun responding at all -- the budget ran out mid-learning, not
+        # post-convergence; the front lifts need a trained CoM shift backward on top
+        # of everything else, which is exactly the expensive part).
+        self.max_iterations = 20000
 
 
 @configclass

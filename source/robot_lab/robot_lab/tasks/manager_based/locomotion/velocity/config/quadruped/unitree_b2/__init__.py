@@ -68,6 +68,17 @@ gym.register(
 )
 
 gym.register(
+    id="RobotLab-Isaac-Velocity-Rough-Unitree-B2-LegLift-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.leg_lift_env_cfg:UnitreeB2LegLiftRoughEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeB2LegLiftPPORunnerCfg",
+        "cusrl_cfg_entry_point": f"{agents.__name__}.cusrl_ppo_cfg:UnitreeB2RoughTrainerCfg",
+    },
+)
+
+gym.register(
     id="RobotLab-Isaac-Velocity-Rough-Unitree-B2-Vision-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,

@@ -88,6 +88,61 @@ WALK_ZERO_PROB = 0.3  # a share of cycles hold still -- pure standing must survi
 WALK_RAMP = 0.3  # s, smooth on/off of the walk command inside the hold window
 WALK_START_DELAY = 0.5  # s into hold before the walk command switches on
 
+# v4 (2026-08-09, user: "Давай делать" -- re-read workshop_legged_gym's own
+# go2_stand/go2.py commit history for the real mechanism behind its bench-confirmed
+# rear-leg walk+turn ("very good walk on rear legs on real robot",
+# "адекватная ходьба и управление влево или вправо"). Two capabilities ported that
+# v3 never had at all:
+#
+# 1. TURNING (command slot 4): v3 had no yaw channel whatsoever -- the bench driver
+#    repurposed the yaw stick as DESCEND purely because nothing else used it. The
+#    original trains ang_vel_yaw [-0.2, 0.2] with its own tracking_ang_vel term;
+#    ours mirrors that as a per-cycle categorical alternative to walking (see
+#    CMD_*_PROB below) rather than a simultaneous free command, matching this
+#    file's own established per-cycle-single-command idiom (v3's walk_vx).
+# 2. GAIT PHASE CLOCK (command slots 2-3, sin/cos): the original's single biggest
+#    structural ingredient, absent from v3 entirely. A continuous, episode-time-
+#    based clock (_get_phase/_get_gait_phase in their go2.py) gives the policy an
+#    internal metronome to swing feet against, AND drives an alternating-stance
+#    reward (rear_stand_rear_feet_contact, below) instead of v3's undifferentiated
+#    "at least one foot down" -- the likely root cause of the bench-confirmed
+#    near-zero displacement on both 30599 and 50598 (nothing ever demanded an
+#    actual alternating STEP, just some contact). Injected into the SAME command
+#    vector consumed by the existing velocity_commands obs term (mdp.generated_commands
+#    reads the whole vector already, same trick jump's own phase command slot uses)
+#    -- no ObservationsCfg change needed, but the vector grows 3->5, so a v4
+#    checkpoint's input layer is NOT warm-start-compatible with 30599's.
+TURN_WZ_RANGE = (-0.4, 0.4)  # rad/s -- original used +-0.2 under a looser tracking_sigma=0.5; a first guess, calibrate from what training produces (same convention as every other first-guess constant in this file)
+
+# v5 (2026-08-11, bench verdict on the completed v4 final 39099: rises and stands
+# CLEAN, walking/turning DO NOT HAPPEN AT ALL -- walk_tracking 0.16 / turn_tracking
+# 0.10 / rear_feet_contact 0.18 in the final training metrics confirm the skills
+# never trained, not just failed to transfer. Full redesign of the walking
+# economics, four coupled causes diagnosed:
+#   1. WALKING EXPOSURE DILUTED: hold was 4-8s inside a ~12-16s cycle, minus
+#      WALK_START_DELAY and ramps -- actual commanded-walking time was ~25% of an
+#      episode at best. Longer holds + shorter idles below.
+#   2. GAIT CLOCK PHYSICALLY TOO FAST: 0.25s/cycle = 4Hz stepping, copied verbatim
+#      from the 15kg Go2. A 74.5kg B2 balancing on two feet cannot plausibly cycle
+#      its stance at 4Hz -- the schedule was unmatchable, so the gait-contact
+#      reward was unearnable and stand-still collected its baseline instead.
+#   3. NEAR-ZERO COMMANDS: walk_vx uniform in [-0.3,0.3] makes half the walk
+#      cycles ask for |vx| < 0.15, where standing still already collects ~70-95%
+#      of the tracking kernel -- the exp-kernel plateau the v4 low_speed term was
+#      supposed to fix, but at weight 0.5 it never outbid the risk.
+#   4. STEPPING PAID TOO LITTLE: the entire gait mechanism (contact schedule 1.0,
+#      clearance 1.0, low_speed 0.5) totaled ~2.5 max against orientation's 8 --
+#      committing to a stride risks the 8 to chase the 2.5. go2_stand's own
+#      contact-schedule term carries w=4 -- the dominant lever there, an
+#      afterthought here. Rebalanced below.
+CMD_STILL_PROB = 0.2  # 0.3 -> 0.2 (v5): still cycles earn their keep, but walking is the scarce skill
+CMD_WALK_PROB = 0.5  # 0.4 -> 0.5 (v5)
+CMD_TURN_PROB = 1.0 - CMD_STILL_PROB - CMD_WALK_PROB
+WALK_VX_MIN = 0.15  # v5: commands below this train nothing (see cause 3 above)
+GAIT_CYCLE_TIME = 0.5  # s -- 0.25 -> 0.5 (v5, cause 2): 2Hz stepping for a robot 5x Go2's mass
+GAIT_BIAS = 0.2  # double-support tolerance band around each sin zero-crossing, matches go2_stand's own bias
+FEET_CLEARANCE_TARGET = 0.05  # m -- matches go2_stand's own target_foot_height; uncalibrated first guess, see rear_stand_feet_clearance's own docstring
+
 
 class RearStandCommand(CommandTerm):
     """Cycle: idle (four legs) -> rise -> hold vertical -> descend -> resample.
@@ -99,13 +154,22 @@ class RearStandCommand(CommandTerm):
     def __init__(self, cfg: "RearStandCommandCfg", env) -> None:
         super().__init__(cfg, env)
         n = self.num_envs
-        self._command = torch.zeros(n, 3, device=self.device)
+        # v4: slots 0=stand signal, 1=walk vx, 2=sin(gait phase), 3=cos(gait phase),
+        # 4=turn wz. Was 3 slots through v3 -- NOT warm-start-compatible with any
+        # earlier checkpoint (input layer shape changed).
+        self._command = torch.zeros(n, 5, device=self.device)
         self.signal = torch.zeros(n, device=self.device)
         self.idle_duration = torch.zeros(n, device=self.device)
         self.hold_duration = torch.zeros(n, device=self.device)
         self.cycle_duration = torch.zeros(n, device=self.device)
         # v3: per-cycle bipedal walk velocity (slot 1, hold phase only).
         self.walk_vx = torch.zeros(n, device=self.device)
+        # v4: per-cycle turn rate (slot 4, hold phase only) -- mutually exclusive
+        # with walk_vx per cycle (see _resample_command), same reasoning as v3's
+        # own single-scalar-command idiom: a combined walk+turn curriculum is a
+        # much harder learning problem than two separate skills, revisit once both
+        # are individually solid.
+        self.turn_wz = torch.zeros(n, device=self.device)
 
     @property
     def command(self) -> torch.Tensor:
@@ -121,11 +185,27 @@ class RearStandCommand(CommandTerm):
         self.hold_duration[env_ids] = hold
         self.cycle_duration[env_ids] = idle + RISE_DURATION + hold + DESCEND_DURATION
         self.time_left[env_ids] = self.cycle_duration[env_ids]
-        # v3: walk velocity for this cycle's hold phase; a share of cycles stay
-        # at 0 so pure standing keeps its own training signal.
-        vx = torch.empty(len(env_ids), device=self.device).uniform_(*self.cfg.walk_vx_range)
-        still = torch.rand(len(env_ids), device=self.device) < self.cfg.walk_zero_prob
-        self.walk_vx[env_ids] = torch.where(still, torch.zeros_like(vx), vx)
+        # v4: this cycle's hold-phase mode is one of {still, walk, turn} -- a
+        # 3-way categorical replacing v3's binary walk_zero_prob so all three
+        # skills keep their own clean training signal instead of fighting over a
+        # combined command.
+        # v5: sample walk speed by MAGNITUDE + random sign instead of uniform over
+        # the full signed range -- uniform sampling made half the walk cycles ask
+        # for |vx| < 0.15, which standing still already nearly satisfies (see the
+        # v5 module comment, cause 3). Every walk cycle now demands a real stride.
+        vx_mag = torch.empty(len(env_ids), device=self.device).uniform_(WALK_VX_MIN, self.cfg.walk_vx_range[1])
+        vx_sign = torch.where(
+            torch.rand(len(env_ids), device=self.device) < 0.5,
+            torch.ones(len(env_ids), device=self.device),
+            -torch.ones(len(env_ids), device=self.device),
+        )
+        vx = vx_mag * vx_sign
+        wz = torch.empty(len(env_ids), device=self.device).uniform_(*self.cfg.turn_wz_range)
+        mode = torch.rand(len(env_ids), device=self.device)
+        is_walk = (mode >= self.cfg.cmd_still_prob) & (mode < self.cfg.cmd_still_prob + self.cfg.cmd_walk_prob)
+        is_turn = mode >= self.cfg.cmd_still_prob + self.cfg.cmd_walk_prob
+        self.walk_vx[env_ids] = torch.where(is_walk, vx, torch.zeros_like(vx))
+        self.turn_wz[env_ids] = torch.where(is_turn, wz, torch.zeros_like(wz))
 
     def _update_command(self):
         elapsed = self.cycle_duration - self.time_left
@@ -137,22 +217,38 @@ class RearStandCommand(CommandTerm):
         self.signal = rising - descending  # 0 idle, ramps up, holds 1, ramps down
         self._command[:, 0] = self.signal
         # v3: slot 1 = walk vx, smoothly ramped on after WALK_START_DELAY into the
-        # hold and back off before the descend begins.
+        # hold and back off before the descend begins. v4: slot 4 = turn wz, same
+        # ramp (shares walk's own on/off timing -- only one of the two is ever
+        # nonzero per cycle, see _resample_command).
         walk_on = hold_start + WALK_START_DELAY
         ramp_in = ((elapsed - walk_on) / WALK_RAMP).clamp(0.0, 1.0)
         ramp_out = ((descend_start - elapsed) / WALK_RAMP).clamp(0.0, 1.0)
         self._command[:, 1] = self.walk_vx * ramp_in * ramp_out
+        self._command[:, 4] = self.turn_wz * ramp_in * ramp_out
+        # v4: gait phase clock runs continuously off real episode time (go2_stand's
+        # own _get_phase), independent of this command's own idle/rise/hold/descend
+        # cycle -- always present in the observation so the policy has a metronome
+        # available even before a walk cycle starts.
+        phase = self._env.episode_length_buf.float() * self._env.step_dt / GAIT_CYCLE_TIME
+        self._command[:, 2] = torch.sin(2.0 * torch.pi * phase)
+        self._command[:, 3] = torch.cos(2.0 * torch.pi * phase)
 
 
 @configclass
 class RearStandCommandCfg(CommandTermCfg):
     class_type: type = RearStandCommand
     resampling_time_range: tuple[float, float] = (8.0, 14.0)  # nominal; overwritten per cycle
-    idle_time_range: tuple[float, float] = (2.0, 4.0)
-    # v3: hold extended (3,6)->(4,8) so a walking cycle has room to actually walk.
-    hold_time_range: tuple[float, float] = (4.0, 8.0)
+    # v5: idle (2,4)->(1.5,3), hold (4,8)->(8,14) -- raise the share of episode
+    # time actually spent vertical-with-a-live-command from ~25% to ~60% (see the
+    # v5 module comment, cause 1: walking exposure was diluted by the cycle).
+    idle_time_range: tuple[float, float] = (1.5, 3.0)
+    hold_time_range: tuple[float, float] = (8.0, 14.0)
     walk_vx_range: tuple[float, float] = WALK_VX_RANGE
     walk_zero_prob: float = WALK_ZERO_PROB
+    # v4 additions -- see the module-level TURN_WZ_RANGE/CMD_*_PROB comment above.
+    turn_wz_range: tuple[float, float] = TURN_WZ_RANGE
+    cmd_still_prob: float = CMD_STILL_PROB
+    cmd_walk_prob: float = CMD_WALK_PROB
     debug_vis: bool = False
 
 
@@ -191,6 +287,20 @@ def _risen_mask(env, asset) -> torch.Tensor:
     commanded = (env.command_manager.get_term("base_velocity").signal > 0.9).float()
     actually = (_fwd_axis_z(asset) > 0.7).float()
     return commanded * actually
+
+
+def _gait_mask(env) -> torch.Tensor:
+    """[num_envs, 2] bool (RR, RL) -- which rear foot should be in STANCE right
+    now, per the command's own sin-phase clock (slot 2) -- go2_stand's own
+    _get_gait_phase, ported: RR stances the first half-cycle, RL the second, both
+    stance through a short double-support window (|sin| < GAIT_BIAS) around each
+    crossing so the swing leg has time to land before its partner lifts."""
+    sin_pos = env.command_manager.get_term("base_velocity").command[:, 2]
+    mask = torch.zeros(sin_pos.shape[0], 2, dtype=torch.bool, device=sin_pos.device)
+    mask[:, 0] = sin_pos >= 0.0  # RR
+    mask[:, 1] = sin_pos < 0.0  # RL
+    mask[sin_pos.abs() < GAIT_BIAS] = True
+    return mask
 
 
 def rear_stand_orientation_tracking(env, asset_cfg=None) -> torch.Tensor:
@@ -273,6 +383,27 @@ def rear_stand_idle_still(env, asset_cfg=None) -> torch.Tensor:
     return (v_xy + w_z) * idle
 
 
+def rear_stand_idle_joint_pose(env, asset_cfg=None) -> torch.Tensor:
+    """L2 penalty on joint deviation from the default quadruped pose, active ONLY
+    during idle (command signal ~0). Added 2026-08-09 (user bench-test on
+    model_50598: right hind leg visibly twisted forward -- both thigh and calf --
+    in the resting four-leg pose; 30599 and 4100 look correct in the same pose).
+
+    Root cause: stand_still_without_cmd and joint_pos_penalty -- the two terms
+    that normally hold the default pose everywhere -- are BOTH zeroed for this
+    entire task (see __post_init__ below, "pulls to 4-leg default pose" --
+    conflicts with rearing). That leaves idle joint symmetry completely
+    unpriced: nothing has ever constrained individual joint angles while on
+    four legs, for the whole life of this task -- an unpriced free variable
+    that could drift at any point in any run; this one just happened to
+    visibly manifest it. Gated the same way as rear_stand_idle_still (signal
+    < 0.1) so it only fires on four legs, never fighting rise/hold/walk/descend."""
+    asset = env.scene[asset_cfg.name if asset_cfg is not None else "robot"]
+    err = torch.sum(torch.square(asset.data.joint_pos - asset.data.default_joint_pos), dim=1)
+    idle = (env.command_manager.get_term("base_velocity").signal < 0.1).float()
+    return err * idle
+
+
 def rear_stand_front_feet_down_idle(env, sensor_cfg=None) -> torch.Tensor:
     """Front feet ON the ground while the command says four-legs (signal ~0).
     Added 2026-08-06 after BOTH the resumed and the from-scratch v2 runs parked in
@@ -289,14 +420,105 @@ def rear_stand_front_feet_down_idle(env, sensor_cfg=None) -> torch.Tensor:
 
 
 def rear_stand_rear_feet_contact(env, sensor_cfg=None) -> torch.Tensor:
-    """REAR feet are the support. v3 change: while a walk command is active a
-    stride NEEDS one foot in the air -- demanding both down (v2's mean) would tax
-    every step at w=1. Walking pays for at-least-one-down (max); standing/rising/
-    descending still pays for both (mean)."""
+    """REAR feet are the support. Standing/rising/descending: both down (mean),
+    unchanged since v2. v4 change (was v3's at-least-one-down max, bench-confirmed
+    on 30599/50598 as "почти нулевое перемещение" -- barely steps): walking now
+    pays for matching the gait-clock's alternating stance/swing schedule exactly
+    (go2_stand's own _reward_rear_feet_contact_and_air, ported) instead of any
+    contact pattern satisfying "at least one down" -- the max-based v3 version let
+    the policy shuffle both feet down with no real stepping rhythm, since two feet
+    planted always satisfied it for free."""
     contact_sensor = env.scene.sensors[sensor_cfg.name]
-    in_contact = (contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :].norm(dim=-1) > 1.0).float()
+    in_contact = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :].norm(dim=-1) > 1.0
     walking = (torch.abs(env.command_manager.get_term("base_velocity").command[:, 1]) > 0.05).float()
-    return walking * in_contact.max(dim=1).values + (1.0 - walking) * in_contact.mean(dim=1)
+    mask = _gait_mask(env)
+    gait_reward = torch.sum((in_contact & mask).float() + (~in_contact & ~mask).float(), dim=1)
+    return walking * gait_reward + (1.0 - walking) * in_contact.float().mean(dim=1)
+
+
+def rear_stand_feet_clearance(env, sensor_cfg=None) -> torch.Tensor:
+    """v4: reward the SWING-phase rear foot (calf-body world Z as the foot-height
+    proxy -- same simplification already used by rear_stand_com_over_support/
+    rear_stand_stance_width in this file) for reaching a target height --
+    go2_stand's own _reward_feet_clearance, ported. Without this, "stepping" can
+    satisfy the gait-contact reward with a foot barely off the ground (any
+    non-contact counts as swing); this prices the swing motion itself. Target is
+    an uncalibrated first guess (same convention as STAND_HEIGHT_TARGET/
+    CROUCH_TARGET_HEIGHT elsewhere in this file) -- it shapes gradient direction,
+    not a hard constraint, so a rough value is fine to start."""
+    asset = env.scene["robot"]
+    body_names = asset.body_names
+    rr, rl = body_names.index("RR_calf"), body_names.index("RL_calf")
+    foot_z = torch.stack([asset.data.body_pos_w[:, rr, 2], asset.data.body_pos_w[:, rl, 2]], dim=1)
+    contact_sensor = env.scene.sensors[sensor_cfg.name]
+    in_contact = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :].norm(dim=-1) > 1.0
+    swing = ~in_contact & ~_gait_mask(env)
+    err = torch.abs(foot_z - FEET_CLEARANCE_TARGET)
+    walking = (torch.abs(env.command_manager.get_term("base_velocity").command[:, 1]) > 0.05).float()
+    return torch.sum(torch.exp(-err) * swing.float(), dim=1) * _risen_mask(env, asset) * walking
+
+
+def rear_stand_foot_slip(env, sensor_cfg=None) -> torch.Tensor:
+    """v4: penalize rear-foot horizontal velocity while in contact -- go2_stand's
+    own _reward_foot_slip, ported. Ungated (fires in any phase, like the
+    original) -- a planted foot sliding is bad whether idle, rising, or walking."""
+    asset = env.scene["robot"]
+    body_names = asset.body_names
+    rr, rl = body_names.index("RR_calf"), body_names.index("RL_calf")
+    foot_speed = torch.stack(
+        [asset.data.body_lin_vel_w[:, rr, 0:2].norm(dim=1), asset.data.body_lin_vel_w[:, rl, 0:2].norm(dim=1)], dim=1
+    )
+    contact_sensor = env.scene.sensors[sensor_cfg.name]
+    in_contact = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :].norm(dim=-1) > 1.0
+    return torch.sum(foot_speed * in_contact.float(), dim=1)
+
+
+def rear_stand_hip_pos(env, asset_cfg=None) -> torch.Tensor:
+    """v4: exp-tracking of default HIP joint angles, unconditional every phase --
+    go2_stand's own _reward_hip_pos, ported. This gait's propulsion is entirely
+    thigh/calf; locking the hips removes 4 of 12 DOF from what the policy needs to
+    coordinate, and is a second, always-on backstop against the same idle
+    free-variable drift rear_stand_idle_joint_pose targets in idle only (bench:
+    twisted RR leg on model_50598)."""
+    asset = env.scene[asset_cfg.name if asset_cfg is not None else "robot"]
+    joint_names = asset.joint_names
+    hip_ids = [i for i, n in enumerate(joint_names) if n.endswith("_hip_joint")]
+    err = torch.sum(torch.square(asset.data.joint_pos[:, hip_ids] - asset.data.default_joint_pos[:, hip_ids]), dim=1)
+    return torch.exp(-err / TRACKING_SIGMA)
+
+
+def rear_stand_low_speed(env, asset_cfg=None) -> torch.Tensor:
+    """v4: coarse threshold penalty on walking speed vs command -- go2_stand's own
+    _reward_low_speed, ported. rear_stand_walk_tracking's exp-kernel is forgiving
+    near zero (a stationary robot still collects ~70% of max reward against a
+    0.3 m/s command at this file's own TRACKING_SIGMA=0.25) -- bench-confirmed
+    "barely steps" on both 30599 and 50598 despite walk_tracking being this
+    task's highest-weighted v3 term. This adds a harder floor: below half the
+    commanded speed pays -1, the wrong direction pays -2, hitting the commanded
+    band (0.5x-1.2x) pays +1.2."""
+    asset = env.scene[asset_cfg.name if asset_cfg is not None else "robot"]
+    cmd_vx = env.command_manager.get_term("base_velocity").command[:, 1]
+    v_walk = torch.sum(asset.data.root_lin_vel_w[:, 0:2] * _walk_dir_xy(asset), dim=1)
+    active = torch.abs(cmd_vx) > 0.05
+    too_slow = v_walk.abs() < 0.5 * cmd_vx.abs()
+    too_fast = v_walk.abs() > 1.2 * cmd_vx.abs()
+    wrong_way = torch.sign(v_walk) != torch.sign(cmd_vx)
+    reward = torch.where(too_slow, -1.0, 0.0)
+    reward = torch.where(~too_slow & ~too_fast, 1.2, reward)
+    reward = torch.where(wrong_way, -2.0, reward)
+    return reward * active.float() * _risen_mask(env, asset)
+
+
+def rear_stand_turn_tracking(env, asset_cfg=None) -> torch.Tensor:
+    """v4: exp-tracking of the commanded yaw rate (slot 4) while risen --
+    go2_stand's own tracking_ang_vel, ported (turning IS a bench-confirmed trained
+    capability there, per its own commit history "адекватная ходьба и управление
+    влево или вправо"). v3 never trained this at all -- the bench driver
+    repurposed the yaw stick as DESCEND purely because nothing else used it."""
+    asset = env.scene[asset_cfg.name if asset_cfg is not None else "robot"]
+    cmd_wz = env.command_manager.get_term("base_velocity").command[:, 4]
+    err = torch.square(cmd_wz - asset.data.root_ang_vel_w[:, 2])
+    return torch.exp(-err / TRACKING_SIGMA) * _risen_mask(env, asset)
 
 
 def rear_stand_walk_tracking(env, asset_cfg=None) -> torch.Tensor:
@@ -315,13 +537,49 @@ def rear_stand_walk_drift(env, asset_cfg=None) -> torch.Tensor:
     """v3: price the free variables of upright locomotion -- lateral slide
     (perpendicular to the walk axis) and yaw spin. Same preemption as jump's
     direction_precision: nothing else bills sideways drift once risen (idle_still
-    is gated to signal<0.1)."""
+    is gated to signal<0.1).
+    v4: yaw is no longer unconditionally priced here -- while a turn is actually
+    commanded, rear_stand_turn_tracking owns yaw (pricing it here too would
+    directly fight that reward); yaw drift during walk/stand cycles is still
+    priced exactly as before."""
     asset = env.scene[asset_cfg.name if asset_cfg is not None else "robot"]
     walk_dir = _walk_dir_xy(asset)
     v_xy = asset.data.root_lin_vel_w[:, 0:2]
     v_perp = v_xy[:, 0] * walk_dir[:, 1] - v_xy[:, 1] * walk_dir[:, 0]
-    w_z = torch.square(asset.data.root_ang_vel_w[:, 2])
+    cmd_wz = env.command_manager.get_term("base_velocity").command[:, 4]
+    not_turning = (torch.abs(cmd_wz) < 0.05).float()
+    w_z = torch.square(asset.data.root_ang_vel_w[:, 2]) * not_turning
     return (torch.square(v_perp) + w_z) * _risen_mask(env, asset)
+
+
+def rear_stand_action_rate_l2_clamped(env) -> torch.Tensor:
+    """Same as isaaclab.envs.mdp.action_rate_l2 (L2-squared rate of change of the
+    action), but the per-dimension diff is clamped BEFORE squaring -- rear_stand-
+    only override of the shared base term (added 2026-08-10 night, user-approved
+    after two live incidents: it18694-19894 on 2026-08-10_03-35-39 hit
+    action_rate_l2 raw sums in the thousands, then a SECOND, larger episode on
+    2026-08-10_08-32-02 (after an entropy_coef fix that only partially helped)
+    reached raw sums whose SQUARE, at weight=-0.01, printed as -1M+ Episode_Reward
+    and blew value_function loss past 700M -- same root cause diagnosed for
+    jump_motor_speed_violation back on 2026-08-08: a rare per-env physics-glitch
+    tick can spike ONE action dimension's frame-to-frame delta arbitrarily far,
+    and an unbounded squared penalty has no ceiling on how hard that one glitch
+    can wreck a whole batch's value-function target.
+
+    Same clamp-before-squaring discipline as jump_motor_speed_violation/
+    jump_airborne_leg_stillness's own postmortem fixes. Bound of 3.0 per
+    dimension is generous relative to any healthy observed diff (normal
+    Episode_Reward/action_rate_l2 stayed in the single digits to tens all
+    night -- raw per-dimension diffs well under 1) while capping the worst
+    possible single-tick contribution at 9 per dimension instead of unbounded.
+
+    Deliberately NOT edited in isaaclab's own mdp.action_rate_l2 (shared library
+    function, used verbatim by rough/crawl/jump/vision too) -- overriding only
+    here keeps those other tasks' already-tuned dynamics untouched, and confines
+    the blast radius of an unreviewed clamp bound to the one task that actually
+    needed it."""
+    diff = (env.action_manager.action - env.action_manager.prev_action).clamp(-3.0, 3.0)
+    return torch.sum(torch.square(diff), dim=1)
 
 
 @configclass
@@ -339,9 +597,12 @@ class UnitreeB2RearStandRoughEnvCfg(UnitreeB2RoughEnvCfg):
         self.curriculum.terrain_levels = None
         self.curriculum.command_levels = None
 
-        # v2: the stance-cycle command replaces the velocity command wholesale
-        # (same 3 slots -> observation layout unchanged; slot 0 = stand signal,
-        # slot 1 reserved for the future bipedal walking command).
+        # v2: the stance-cycle command replaces the velocity command wholesale.
+        # v4: command grew 3->5 slots (stand signal, walk vx, sin/cos gait phase,
+        # turn wz) -- flows straight into the existing velocity_commands obs term
+        # (mdp.generated_commands reads the whole vector) with no ObservationsCfg
+        # change, but this DOES change the policy's input width, so a v4
+        # checkpoint cannot warm-start from any v2/v3 one.
         self.commands.base_velocity = RearStandCommandCfg()
 
         # -- retire everything that pulls toward the flat quadruped stand
@@ -354,6 +615,14 @@ class UnitreeB2RearStandRoughEnvCfg(UnitreeB2RoughEnvCfg):
         self.rewards.feet_contact_without_cmd.weight = 0  # front feet must be OFF
         self.rewards.lin_vel_z_l2.weight = 0  # the rise IS vertical motion
         self.rewards.ang_vel_xy_l2.weight = 0  # the rise IS a pitch rotation
+
+        # 2026-08-10 night: rear_stand-only override of the shared action_rate_l2
+        # base term -- see rear_stand_action_rate_l2_clamped's own docstring for
+        # the two-incident postmortem (up to -1M+ Episode_Reward, value_function
+        # loss past 700M, from one rare per-env glitch tick, unbounded). Same
+        # weight as rough's own default (-0.01) -- only the formula changed
+        # (clamp before squaring), not the pricing.
+        self.rewards.action_rate_l2 = RewTerm(func=rear_stand_action_rate_l2_clamped, weight=-0.01)
 
         # -- the rear-stand objective (weights mirror go2_stand's own proportions)
         # 5 -> 8 (2026-08-06, both v2 starts parked half-risen): with no falls at
@@ -368,6 +637,13 @@ class UnitreeB2RearStandRoughEnvCfg(UnitreeB2RoughEnvCfg):
         )
         self.rewards.rear_stand_com_over_support = RewTerm(
             func=rear_stand_com_over_support, weight=2.0, params={"asset_cfg": SceneEntityCfg("robot")}
+        )
+        # v4 (2026-08-09): unconditional hip anchor, go2_stand's own hip_pos
+        # ported -- see the function's own docstring. Weight matched to
+        # rear_stand_height's own 3.0 (same "secondary anchor" scale as
+        # orientation's 8/height's 3 proportions, per this block's own comment).
+        self.rewards.rear_stand_hip_pos = RewTerm(
+            func=rear_stand_hip_pos, weight=3.0, params={"asset_cfg": SceneEntityCfg("robot")}
         )
         self.rewards.rear_stand_front_feet_contact = RewTerm(
             func=rear_stand_front_feet_contact,
@@ -385,20 +661,69 @@ class UnitreeB2RearStandRoughEnvCfg(UnitreeB2RoughEnvCfg):
         self.rewards.rear_stand_idle_still = RewTerm(
             func=rear_stand_idle_still, weight=-2.0, params={"asset_cfg": SceneEntityCfg("robot")}
         )
+        # New 2026-08-09 (user bench-test on model_50598: twisted RR leg at idle --
+        # see the function's own docstring for the root-cause analysis). Weight
+        # matched to rear_stand_idle_still's own -2.0 -- same "idle discipline"
+        # scale, no reason to weight joint symmetry differently than idle drift.
+        self.rewards.rear_stand_idle_joint_pose = RewTerm(
+            func=rear_stand_idle_joint_pose, weight=-2.0, params={"asset_cfg": SceneEntityCfg("robot")}
+        )
         self.rewards.rear_stand_rear_feet_contact = RewTerm(
             func=rear_stand_rear_feet_contact,
-            weight=1.0,
+            # 1.0 -> 3.0 (v5): the alternating contact schedule is go2_stand's own
+            # DOMINANT walking lever (their w=4); at 1.0 here it was an afterthought
+            # the stand-still baseline could shrug off (see v5 module comment,
+            # cause 4). Still below orientation's 8 -- falling must never win.
+            weight=3.0,
             params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=["RL_calf", "RR_calf"])},
         )
 
         # -- v3: bipedal walking while vertical (command slot 1, hold phase).
-        # Tracking 3.0: enough to make stepping pay, deliberately below
+        # 3.0 -> 5.0 (2026-08-07, run 08-24-06 plateaued ~5000 iters, noise_std
+        # DECLINING not climbing -- unlike jump's own plateaus this isn't a
+        # temporary lull, it's converged economics: orientation_tracking already
+        # sits near its ceiling (7.6/8) while walk_tracking stalled at ~1.2/~3 max
+        # -- committing to a real stride risks the orientation term for too little
+        # walking payoff, so the policy plays it safe and barely steps. Still below
         # orientation's 8 -- falling over to chase velocity must never win.
         self.rewards.rear_stand_walk_tracking = RewTerm(
-            func=rear_stand_walk_tracking, weight=3.0, params={"asset_cfg": SceneEntityCfg("robot")}
+            func=rear_stand_walk_tracking, weight=5.0, params={"asset_cfg": SceneEntityCfg("robot")}
         )
         self.rewards.rear_stand_walk_drift = RewTerm(
             func=rear_stand_walk_drift, weight=-1.0, params={"asset_cfg": SceneEntityCfg("robot")}
+        )
+
+        # -- v4: gait-quality shaping for the walk (go2_stand's own feet_clearance/
+        # foot_slip/low_speed, ported -- see each function's own docstring).
+        self.rewards.rear_stand_feet_clearance = RewTerm(
+            func=rear_stand_feet_clearance,
+            # 1.0 -> 2.0 (v5): scaled up alongside rear_feet_contact's own 3.0 --
+            # the swing half of the same gait mechanism (see v5 module comment).
+            weight=2.0,
+            params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=["RL_calf", "RR_calf"])},
+        )
+        self.rewards.rear_stand_foot_slip = RewTerm(
+            func=rear_stand_foot_slip,
+            weight=-2.0,
+            params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=["RL_calf", "RR_calf"])},
+        )
+        # go2_stand's own low_speed carried weight=0.005 against ~1-2 magnitude raw
+        # reward (a light nudge on top of the gait-clock mechanism, which is the
+        # actual dominant lever there). Sized proportionally into this file's own
+        # weight scale (walk_tracking=5.0) instead of copying their absolute number.
+        # 0.5 -> 1.5 (v5): at 0.5 the "-1 for standing during a walk command" floor
+        # cost -0.5/s against orientation's safe +8/s -- an ignorable tax (see v5
+        # module comment, cause 4). At 1.5 the too-slow floor is -1.5/s and the
+        # in-band bonus +1.8/s: a 3.3/s swing for actually striding.
+        self.rewards.rear_stand_low_speed = RewTerm(
+            func=rear_stand_low_speed, weight=1.5, params={"asset_cfg": SceneEntityCfg("robot")}
+        )
+
+        # -- v4: turning (command slot 4, hold phase) -- go2_stand's own
+        # tracking_ang_vel, ported. Weight matched to walk_tracking's own 5.0 --
+        # no reason to favor one bipedal skill's gradient over the other.
+        self.rewards.rear_stand_turn_tracking = RewTerm(
+            func=rear_stand_turn_tracking, weight=5.0, params={"asset_cfg": SceneEntityCfg("robot")}
         )
 
         # If the weight of rewards is 0, set rewards to None

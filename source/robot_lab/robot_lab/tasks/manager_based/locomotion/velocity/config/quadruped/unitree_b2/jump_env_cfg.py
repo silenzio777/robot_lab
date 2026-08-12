@@ -232,6 +232,77 @@ def jump_crouch(env, command_name: str) -> torch.Tensor:
     return err * in_crouch.float()
 
 
+def jump_motor_speed_violation(env, asset_cfg=None) -> torch.Tensor:
+    """Penalty on leg joint velocity exceeding its REAL hardware speed rating
+    (hip/thigh 23 rad/s, calf 14 rad/s), everywhere (no phase gate -- both launch
+    push-off and landing impact are where this happens).
+
+    Added 2026-08-07 after a live bench test found the trained checkpoint
+    (b2_jump_48499) reading 100-126% of real velocity on the bench's own
+    motor-limit bars for every direction, worst on the calf: forward 126%,
+    backward 118%, left/right 106%. Root-cause verified empirically (scripted
+    bench reproduction, not guessed): TORQUE was already correctly clipped to
+    100% by the DC-motor curve (bench and training use the identical curve --
+    confirmed byte-for-byte, ctrl==actuator_force in the reproduction) -- the
+    curve shapes available torque near the speed limit but does NOT hard-clamp
+    velocity itself, so momentum from an explosive push-off or a stiff landing
+    can carry the joint past its rated speed for free. Nothing in this file
+    priced raw joint speed before now -- the master free-variable lesson,
+    instance N: locomotion skills never approach this because their own reward
+    shaping never asks for peak speed, but a discrete explosive jump's entire
+    mechanism is peak instantaneous power, so it needs its own explicit price.
+
+    Excess ratio clamped to [0, 2] (2026-08-07, run 21-55-47: reward exploded to
+    -1.1M on isolated iterations, ~30x more often than the pre-fix baseline run's
+    own rare -1000-to--3000 outliers -- traced to THIS term: unbounded, a single
+    rare physics-glitch env with a momentary extreme joint velocity (contact
+    catastrophe, not a real jump event) produced an astronomical squared penalty
+    with no ceiling, wrecking that batch's value-function target. Every other
+    term in this file already bounds its own worst case (velocity clamps, force
+    thresholds) -- this one didn't, and a term meant to gently price a 100-126%
+    overspeed has no business paying out as if speed were 10000%."""
+    asset = env.scene[asset_cfg.name if asset_cfg is not None else "robot"]
+    joint_names = asset.joint_names
+    leg_ids = [i for i, n in enumerate(joint_names) if n.endswith(("_hip_joint", "_thigh_joint", "_calf_joint"))]
+    limits = torch.tensor(
+        [14.0 if joint_names[i].endswith("_calf_joint") else 23.0 for i in leg_ids],
+        device=asset.data.joint_vel.device,
+    )
+    leg_vel = asset.data.joint_vel[:, leg_ids]
+    excess = (leg_vel.abs() / limits - 1.0).clamp(min=0.0, max=2.0)
+    return torch.sum(torch.square(excess), dim=1)
+
+
+def jump_airborne_leg_stillness(env, command_name: str, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Penalty on leg joint velocity while genuinely airborne (all 4 feet off the
+    ground, post-crouch) -- added 2026-08-09 (user, bench: "дрыганье ногами в воздухе").
+
+    Once the feet leave the ground the trajectory is already ballistic -- nothing the
+    legs do mid-flight changes where the robot lands (jump_direction_precision prices
+    the launch push, not the air). No existing term touches this window: jump_flight/
+    jump_flight_distance/jump_vertical_launch all pay for BEING airborne, not for what
+    the joints do while there, and jump_landing_impact/jump_landing_settle only fire
+    after touchdown -- an unpriced free variable, the same lesson as every other gap in
+    this file. Priced hard per the user's explicit request ("жестко штрафовать").
+
+    Same normalize-by-rated-limit + clamp discipline as jump_motor_speed_violation
+    (its own docstring has the postmortem: an unbounded squared term let one rare
+    physics-glitch tick blow up a batch's value-function target) -- clamped before
+    squaring so this can't repeat that failure."""
+    term = env.command_manager.get_term(command_name)
+    asset = env.scene["robot"]
+    joint_names = asset.joint_names
+    leg_ids = [i for i, n in enumerate(joint_names) if n.endswith(("_hip_joint", "_thigh_joint", "_calf_joint"))]
+    limits = torch.tensor(
+        [14.0 if joint_names[i].endswith("_calf_joint") else 23.0 for i in leg_ids],
+        device=asset.data.joint_vel.device,
+    )
+    normalized = (asset.data.joint_vel[:, leg_ids] / limits).clamp(-3.0, 3.0)
+    airborne = _feet_airborne(env, sensor_cfg)
+    post_crouch = term.window_active & (term.phase >= CROUCH_PHASE_END)
+    return torch.sum(torch.square(normalized), dim=1) * (airborne & post_crouch).float()
+
+
 def jump_landing_impact(env, command_name: str, sensor_cfg: SceneEntityCfg, soft_threshold: float) -> torch.Tensor:
     """Phase 4: absorption. During the landing slice, penalize foot contact force
     beyond a soft threshold -- a stiff-legged slam spikes way past it, an absorbing
@@ -288,6 +359,70 @@ def jump_idle_height(env, command_name: str, target_height: float) -> torch.Tens
     # takes over pulling the robot back up when the NEXT idle begins.
     idle = ~term.window_active & ~term.landing_active
     return err * idle.float()
+
+
+# Left-right joint pairs shared by the symmetry terms below.
+_LR_JOINT_PAIRS = [
+    ("FL_hip_joint", "FR_hip_joint"),
+    ("FL_thigh_joint", "FR_thigh_joint"),
+    ("FL_calf_joint", "FR_calf_joint"),
+    ("RL_hip_joint", "RR_hip_joint"),
+    ("RL_thigh_joint", "RR_thigh_joint"),
+    ("RL_calf_joint", "RR_calf_joint"),
+]
+
+
+def _lr_asymmetry(asset) -> torch.Tensor:
+    """Summed L1 left-right joint-angle asymmetry over _LR_JOINT_PAIRS."""
+    joint_names = asset.joint_names
+    left_ids = [joint_names.index(left) for left, right in _LR_JOINT_PAIRS]
+    right_ids = [joint_names.index(right) for left, right in _LR_JOINT_PAIRS]
+    return torch.sum(torch.abs(asset.data.joint_pos[:, left_ids] - asset.data.joint_pos[:, right_ids]), dim=1)
+
+
+def jump_idle_symmetry(env, command_name: str) -> torch.Tensor:
+    """L1 penalty on left-right joint asymmetry during idle (added 2026-08-09,
+    bench: right leg visibly tucked under the body during idle -- an unstable
+    tripod-like stance, "как будто болит" -- while the crouch/launch/landing
+    poses stayed fine. Root-cause diagnosed empirically (headless MuJoCo probe,
+    not guessed): checkpoints 71000/91000/91799 are all left-right symmetric in
+    idle (FR_hip vs FL_hip within 0.1 rad); only the latest fine-tune
+    (91799->104700, which added jump_airborne_leg_stillness and tightened
+    jump_direction_precision) drifted asymmetric (FR_hip=0.44 vs FL_hip=-0.01).
+    Neither new term touches this -- both gate on term.window_active, zero
+    during idle -- so this is collateral drift from continued training (one
+    shared network across all phases), not a direct reward-shaping cause.
+    stand_still_without_cmd/joint_pos_penalty (inherited, active in idle) price
+    total L1 deviation from default but not asymmetry specifically -- a
+    lopsided-but-bounded-magnitude pose can satisfy that sum cheaply. This
+    prices |left - right| per joint pair directly so idle can't settle into a
+    lopsided stance regardless of what else drifts elsewhere."""
+    term = env.command_manager.get_term(command_name)
+    asset = env.scene["robot"]
+    idle = ~term.window_active & ~term.landing_active
+    return _lr_asymmetry(asset) * idle.float()
+
+
+def jump_flight_symmetry(env, command_name: str, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
+    """L1 penalty on left-right joint asymmetry during FLIGHT and LANDING (added
+    2026-08-11, bench verdict on b2_jump_124699: the right front leg stays folded
+    through flight and touchdown while the left one gets thrown upward -- the same
+    chronic asymmetry jump_idle_symmetry already prices in idle, but that term
+    deliberately gates OFF for the whole window+landing, so the air and the
+    touchdown were left unpriced (free variable, instance N).
+    jump_airborne_leg_stillness prices joint VELOCITY in flight, not pose -- a leg
+    frozen in a folded position is perfectly "still" and passes it for free.
+
+    Gate: genuinely airborne post-crouch, OR the landing slice. A symmetric tuck
+    mid-flight satisfies this at zero cost (both sides fold together); only a
+    lopsided pose pays. Sideways jumps launch off asymmetric GROUNDED pushes --
+    those stay free (this fires only once airborne, where the trajectory is
+    ballistic and an asymmetric pose serves nothing)."""
+    term = env.command_manager.get_term(command_name)
+    asset = env.scene["robot"]
+    airborne = _feet_airborne(env, sensor_cfg) & term.window_active & (term.phase >= CROUCH_PHASE_END)
+    active = airborne | term.landing_active
+    return _lr_asymmetry(asset) * active.float()
 
 
 def jump_direction_velocity(env, command_name: str, max_vel: float) -> torch.Tensor:
@@ -352,14 +487,26 @@ def jump_direction_precision(env, command_name: str) -> torch.Tensor:
 
 def jump_landing_settle(env, command_name: str) -> torch.Tensor:
     """Penalty during the post-window landing slice: angular thrash and residual
-    vertical velocity mean a crash-landing, not a landing. stand_still_without_cmd
+    vertical/horizontal velocity mean a crash-landing, not a landing. stand_still_without_cmd
     (command is zeros here) simultaneously pulls the joints back to the default
-    stance -- together: touch down, kill the motion, stand."""
+    stance -- together: touch down, kill the motion, stand.
+
+    ang widened to all 3 axes + lin_xy added (2026-08-08, bench: b2_jump_71000
+    doesn't fall anymore but every direction rotates 30-35 deg on touchdown --
+    right/left ALSO drift backward on landing, not just in flight): the old
+    roll/pitch-only ang term and jump_idle_still's own wz/v_xy pricing both
+    penalize RATE, not the accumulated heading/position error a fast impulsive
+    touchdown spin/skid leaves behind after the rate itself decays back to zero
+    -- by the time idle_still's broad, episode-averaged penalty registers
+    anything, the robot has already spun/slid and stopped. This is the exact
+    moment (landing_active, freshly strengthened to weight -1.5) where that
+    impulse actually happens -- price it there directly instead of relying on
+    the diffuse aftermath term to catch it."""
     term = env.command_manager.get_term(command_name)
     asset = env.scene["robot"]
-    ang = torch.sum(torch.square(asset.data.root_ang_vel_w[:, 0:2]), dim=1)
-    lin_z = torch.square(asset.data.root_lin_vel_w[:, 2])
-    return (ang + lin_z) * term.landing_active.float()
+    ang = torch.sum(torch.square(asset.data.root_ang_vel_w), dim=1)
+    lin_xyz = torch.sum(torch.square(asset.data.root_lin_vel_w), dim=1)
+    return (ang + lin_xyz) * term.landing_active.float()
 
 
 @configclass
@@ -437,8 +584,33 @@ class UnitreeB2JumpRoughEnvCfg(UnitreeB2RoughEnvCfg):
         )
         self.rewards.jump_landing_settle = RewTerm(
             func=jump_landing_settle,
-            weight=-0.5,
+            # -0.5 -> -1.5 (2026-08-07, bench: backward jump "падает почти всегда"):
+            # backward is the robot's naturally strongest direction (hind-leg-dominant
+            # push), so it carries the most momentum into landing -- absorption was
+            # priced the same for every direction while the hardest case needed more.
+            weight=-1.5,
             params={"command_name": "base_velocity"},
+        )
+        # New 2026-08-07 (bench: torque/velocity/joint-range bars all red, 100-126%
+        # of real hardware -- see jump_motor_speed_violation's own docstring for the
+        # verified root cause). Weight moderate: this must discourage a dangerously
+        # fast leg swing without killing the launch itself (vertical_launch/direction
+        # terms still dominate at 8/4).
+        self.rewards.jump_motor_speed_violation = RewTerm(
+            func=jump_motor_speed_violation, weight=-2.0, params={"asset_cfg": SceneEntityCfg("robot")}
+        )
+        # New 2026-08-09 (user, bench: "дрыганье ногами в воздухе во время самого
+        # прыжка" -- explicit ask to "жестко штрафовать" this). Weight matched roughly
+        # to jump_motor_speed_violation's own -2.0 (same normalize-by-limit + clamp
+        # scale, so the two penalties sit in comparable units) but pushed harder per
+        # the user's explicit request for a hard stop, not a gentle nudge.
+        self.rewards.jump_airborne_leg_stillness = RewTerm(
+            func=jump_airborne_leg_stillness,
+            weight=-3.0,
+            params={
+                "command_name": "base_velocity",
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_calf"),
+            },
         )
         # Weight history: 1.0 in run 2026-08-04_22-14-17 -- too weak, the exact
         # stand-still optimum returned (vertical_launch flatlined at ~0.02-0.04,
@@ -453,7 +625,11 @@ class UnitreeB2JumpRoughEnvCfg(UnitreeB2RoughEnvCfg):
         )
         self.rewards.jump_landing_impact = RewTerm(
             func=jump_landing_impact,
-            weight=-0.5,
+            # -0.5 -> -2.0 (2026-08-07, same bench finding as landing_settle above):
+            # weak relative to vertical_launch/flight at 8 -- a stiff-legged slam was
+            # cheaper than it looked once the launch got this powerful (~1-1.5m jumps,
+            # far past the original 0.5m target).
+            weight=-2.0,
             params={
                 "command_name": "base_velocity",
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_calf"),
@@ -471,6 +647,28 @@ class UnitreeB2JumpRoughEnvCfg(UnitreeB2RoughEnvCfg):
             func=jump_idle_height,
             weight=-8.0,
             params={"command_name": "base_velocity", "target_height": 0.53},
+        )
+        # New 2026-08-09 (bench: right leg tucked under body in idle -- see
+        # jump_idle_symmetry's own docstring for the empirical diagnosis chain).
+        # Weight matched to jump_idle_still (-3.0, same idle-only gate) -- assertive
+        # since it never competes with the jump-phase economics (zero outside idle).
+        self.rewards.jump_idle_symmetry = RewTerm(
+            func=jump_idle_symmetry,
+            weight=-3.0,
+            params={"command_name": "base_velocity"},
+        )
+        # New 2026-08-11 (bench on 124699: right front folded in flight/landing,
+        # left thrown up -- see jump_flight_symmetry's own docstring). Moderate
+        # weight: a symmetric tuck costs zero, so this only bites lopsidedness;
+        # kept below idle_symmetry's -3.0 because flight competes with the live
+        # jump economics (direction/precision) in a way idle never does.
+        self.rewards.jump_flight_symmetry = RewTerm(
+            func=jump_flight_symmetry,
+            weight=-1.5,
+            params={
+                "command_name": "base_velocity",
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_calf"),
+            },
         )
         # Weight history (the jump-vs-direction economics took three passes):
         # v1: vertical 8, direction absent -> perfect vertical jump IN PLACE.
@@ -504,9 +702,19 @@ class UnitreeB2JumpRoughEnvCfg(UnitreeB2RoughEnvCfg):
         # -0.5 -> -1.5 (2026-08-06 fine-tune): the ignition-era softness served its
         # purpose (cascade happened); bench shows left jumps twisting the body hard
         # left -- yaw/smear discipline comes back now that the jump itself exists.
+        # -1.5 -> -2.5 (2026-08-09, user: "отклонение от курса... просто выровнять"):
+        # an earlier pass already tried -2.0 (see history above, "sparks without fire"
+        # -- direction pressure crushed the launch itself before it could ignite) but
+        # that was BEFORE vertical_launch/flight/direction_velocity all grew to their
+        # current strength and before landing_settle priced yaw too -- the jump's own
+        # economics now dominate this term by a much wider margin than they did then,
+        # so re-tightening is a fresh attempt, not a blind repeat of the old mistake.
+        # If this reproduces the old symptom (jump amplitude collapsing, not just
+        # straightening), the next step is a partial revert toward ~-2.0, not further
+        # escalation.
         self.rewards.jump_direction_precision = RewTerm(
             func=jump_direction_precision,
-            weight=-1.5,
+            weight=-2.5,
             params={"command_name": "base_velocity"},
         )
 
