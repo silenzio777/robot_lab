@@ -1,50 +1,51 @@
-# B2 cloud training image — build & run guide
+# Образ для облачного обучения B2 — сборка и запуск
 
-This directory builds a self-contained Docker image for running Isaac Lab
-reinforcement-learning training for a quadruped robot (Unitree B2) task set,
-on a fresh cloud GPU machine.
+Эта директория собирает автономный Docker-образ для запуска обучения с
+подкреплением (Isaac Lab) на четвероногом роботе (Unitree B2) на чистой
+облачной GPU-машине.
 
-## What's in this directory
+## Что лежит в этой директории
 
-- `Dockerfile` — builds the image.
-- `b2_overlay/` — a small set of task-config source files copied into the
-  image at build time (robot/task definitions, training hyperparameters).
-- `sync_results.sh` — helper to pull finished checkpoints back to wherever
-  you run it from, over `rsync`/`ssh`.
+- `Dockerfile` — собирает образ.
+- `b2_overlay/` — небольшой набор конфигурационных файлов задачи,
+  копируемых в образ при сборке (описание робота/задачи, гиперпараметры
+  обучения).
+- `sync_results.sh` — вспомогательный скрипт для скачивания готовых
+  чекпоинтов туда, откуда его запускают, через `rsync`/`ssh`.
 
-Nothing else in this directory is needed to build or run the image.
+Больше ничего из этой директории для сборки или запуска образа не нужно.
 
-## Requirements on the target machine
+## Требования к целевой машине
 
 - Ubuntu 22.04, x86_64.
-- An NVIDIA GPU (tested target class: H100/H200, RTX 5090, RTX 6000) with a
-  recent driver (>= 550) and `nvidia-container-toolkit` installed, so
-  `docker run --gpus all` works.
-- Docker Engine (20.10+) with the NVIDIA runtime configured.
-- ~40 GB free disk for the built image plus training logs.
-- Internet access during the build (the Dockerfile pulls the base image and
-  clones two public GitHub repositories).
+- NVIDIA GPU (ориентир: H100/H200, RTX 5090, RTX 6000) со свежим драйвером
+  (>= 550) и установленным `nvidia-container-toolkit`, чтобы работал
+  `docker run --gpus all`.
+- Docker Engine (20.10+) с настроенным NVIDIA runtime.
+- ~40 ГБ свободного диска под образ и логи обучения.
+- Доступ в интернет во время сборки (Dockerfile скачивает базовый образ и
+  клонирует два публичных репозитория GitHub).
 
-Quick check that GPU passthrough is working before building anything:
+Быстрая проверка, что GPU-passthrough работает, до начала сборки:
 ```bash
 docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi
 ```
 
-## Build
+## Сборка
 
-From inside this directory (this exact directory must be the Docker build
-context — do not build from a parent directory):
+Из этой директории (именно она должна быть контекстом сборки Docker — не
+собирать из родительской директории):
 
 ```bash
 cd docker/cloud
 docker build -t b2-cloud-train .
 ```
 
-This will take a while the first time (base image pull + full Isaac Lab
-install). Nothing outside this directory is sent to Docker or read during
-the build.
+В первый раз сборка займёт время (скачивание базового образа + полная
+установка Isaac Lab). Ничего за пределами этой директории в Docker не
+отправляется и не читается во время сборки.
 
-## Run training
+## Запуск обучения
 
 ```bash
 mkdir -p ./cloud_logs
@@ -55,73 +56,75 @@ docker run --rm -it --gpus all \
     --task <TASK_NAME> --headless
 ```
 
-Replace `<TASK_NAME>` with the Gym task id you were given (e.g. something
-registered under `RobotLab-Isaac-Velocity-Rough-Unitree-B2-*`). To see the
-full list of registered tasks available in the image:
+Вместо `<TASK_NAME>` подставить выданный вам идентификатор Gym-задачи
+(например, что-то из зарегистрированных под
+`RobotLab-Isaac-Velocity-Rough-Unitree-B2-*`). Чтобы увидеть полный список
+задач, зарегистрированных в образе:
 
 ```bash
 docker run --rm b2-cloud-train \
   ./isaaclab.sh -p scripts/environments/list_envs.py
 ```
 
-Useful `train.py` flags:
-- `--headless` — no GUI, required on a server without a display.
-- `--num_envs <N>` — override the number of parallel simulation environments.
-- `--max_iterations <N>` — override training length.
-- `--resume --load_run <run_dir> --checkpoint <file>` — resume from a
-  checkpoint already present under `logs/` (e.g. one you copied in from a
-  previous session).
+Полезные флаги `train.py`:
+- `--headless` — без GUI, обязателен на сервере без дисплея.
+- `--num_envs <N>` — переопределить число параллельных сред симуляции.
+- `--max_iterations <N>` — переопределить длину обучения.
+- `--resume --load_run <run_dir> --checkpoint <file>` — продолжить с
+  чекпоинта, уже лежащего под `logs/` (например, скопированного из
+  предыдущей сессии).
 
-Training writes checkpoints (`model_*.pt`), a config snapshot, and
-TensorBoard event files under `logs/rsl_rl/<task>/<run_timestamp>/` inside
-the container, which — because of the `-v` mount above — appears directly
-on the host at `./cloud_logs/rsl_rl/<task>/<run_timestamp>/`.
+Обучение пишет чекпоинты (`model_*.pt`), снимок конфига и файлы событий
+TensorBoard в `logs/rsl_rl/<task>/<run_timestamp>/` внутри контейнера, что
+благодаря монтированию `-v` выше сразу появляется на хосте в
+`./cloud_logs/rsl_rl/<task>/<run_timestamp>/`.
 
-To watch progress remotely:
+Смотреть прогресс удалённо:
 ```bash
 tensorboard --logdir ./cloud_logs --bind_all
 ```
 
-## Getting results back
+## Забрать результаты обратно
 
-From the machine where you want the results (not necessarily the same one
-that ran the build), with SSH access to the training machine:
+С машины, куда нужны результаты (необязательно той же, что собирала
+образ), при наличии SSH-доступа к машине обучения:
 
 ```bash
 ./sync_results.sh user@training-host [remote_path_to_robot_lab]
 ```
 
-This does a read-only `rsync` pull of `model_*.pt`, `*.onnx`, `*.yaml`, and
-TensorBoard event files from `<remote_path_to_robot_lab>/logs/` into
-`../../cloud_results/` (relative to this directory). It never uploads
-anything to the remote host.
+Это делает read-only `rsync`-выкачку `model_*.pt`, `*.onnx`, `*.yaml` и
+файлов событий TensorBoard из `<remote_path_to_robot_lab>/logs/` в
+`../../cloud_results/` (относительно этой директории). Ничего на удалённую
+машину не загружается.
 
-If you'd rather do it manually:
+Вручную то же самое:
 ```bash
 rsync -avz user@training-host:~/robot_lab/logs/ ./cloud_results/
 ```
 
-## Exporting a trained policy to ONNX (optional)
+## Экспорт обученной политики в ONNX (опционально)
 
-Isaac Lab / rsl_rl ship a standalone checkpoint→ONNX exporter that does not
-need a GPU or a running simulation — useful for exporting on a lighter
-machine after pulling the `.pt` file back:
+Isaac Lab / rsl_rl поставляют отдельный экспортёр чекпоинт→ONNX, которому
+не нужен ни GPU, ни запущенная симуляция — удобно экспортировать уже на
+более лёгкой машине после скачивания `.pt`-файла:
 
 ```bash
 ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py \
   --task <TASK_NAME> --checkpoint <path_to_model.pt> --headless
 ```
 
-(consult `--help` on that script for export-only flags in your image's
-version if you don't need to run a play/visualization episode).
+(смотрите `--help` этого скрипта на предмет флагов только-экспорта в вашей
+версии образа, если не нужен проигрыш/визуализация эпизода).
 
-## Notes
+## Заметки
 
-- The image is built entirely from public sources at build time (the base
-  NVIDIA Isaac Sim image, plus two public GitHub repositories cloned fresh
-  inside the Dockerfile) plus the small overlay of task-config files in
-  `b2_overlay/`. There is no other project data baked into the image.
-- If a build step fails on version resolution, check that the base image
-  tag in `Dockerfile` and the pinned Python package versions are still
-  available — NVIDIA's container registry and PyPI occasionally deprecate
-  old tags/wheels.
+- Образ целиком собирается из публичных источников во время сборки
+  (базовый образ NVIDIA Isaac Sim плюс два публичных репозитория GitHub,
+  клонируемых заново прямо в Dockerfile) плюс небольшой оверлей
+  конфигурационных файлов задачи в `b2_overlay/`. Никаких других данных
+  проекта в образ не запечено.
+- Если шаг сборки падает на разрешении версий — проверьте, что тег
+  базового образа в `Dockerfile` и закреплённые версии Python-пакетов всё
+  ещё доступны — реестр контейнеров NVIDIA и PyPI иногда снимают с
+  публикации старые теги/wheel-файлы.
