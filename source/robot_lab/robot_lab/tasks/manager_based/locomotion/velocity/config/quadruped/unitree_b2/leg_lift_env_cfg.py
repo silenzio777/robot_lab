@@ -4,22 +4,44 @@
 """Single-leg lift ("трипод") for B2 -- a deliberately simple test task (user, 2026-08-09:
 "он простой, тестовый, я хочу понять что можно делать через RL а что придётся через IL").
 
-Setup: the robot stands stable on all four legs. A held direction command lifts exactly
-ONE leg and holds the other three as a tripod support, torso free to lean for balance
-(not held flat -- that's the user's own explicit spec, not an oversight):
-  - forward -> front-left  (FL)
-  - right   -> front-right (FR)
-  - back    -> rear-right  (RR)
-  - left    -> rear-left   (RL)
+v8 (2026-08-19, task relayed by claude-tg-base, `train_research/LEG_LIFT_V8_TASK.md`):
+REDESIGN from scratch on top of v2/v7's proven skeleton (support/height/pose economy
+kept, see the individual functions below -- most are unchanged from v7), adding the
+four things v7 structurally lacked:
+  1. a POSITIVE air package on the selected leg (feet_on_air/feet_air_time, ported
+     from unitree_a1_handstand's own rewards.py, masked per-env instead of a static
+     body subset since here the "which leg" varies per env/command);
+  2. a CoM-over-support-TRIANGLE term (centroid of the three support feet, not a
+     fixed pair -- see leg_lift_com_over_support);
+  3. a secondary joint-angle anchor on the lifted leg's thigh+calf toward a "foot
+     folded up near the body" pose (leg_lift_joint_fold), decoupled from pure
+     clearance the same way rear_stand_rear_leg_extension decoupled knee angle from
+     root height;
+  4. a Rudin-style PER-ENV game curriculum on the lift-height target (height_target
+     lives on the command term itself, bumped per env based on that env's own
+     previous-cycle success/failure -- not a global schedule).
 
-Structurally closest to rear_stand's OWN v1/v2 (a held ramped signal drives a static
-target pose, not a periodic gait -- see feet_air_time/feet_gait staying at their rough
-defaults of 0, same "not a gait" reasoning as jump_env_cfg's own docstring) crossed with
-jump's direction-vector command idiom (a unit vector picks WHICH of several discrete
-things happens, see JumpPulseCommand). Command stays the same 3 slots every other
-non-vision B2 variant uses ([signal, dir_x, dir_y]) -- NOT jump's 5-slot rear-stand-v4
-kind of growth -- so a plain 45-obs checkpoint (e.g. the standard rough walking run) can
-warm-start this one if desired; nothing here needs a wider observation.
+COMMAND INTERFACE CHANGED (owner's explicit spec this time, not a v7-era holdover):
+2 slots now, a genuine (lin_vel_x, lin_vel_y)-shaped cmd_vel instead of v7's
+[lift_signal, dir_x, dir_y] -- the ramped magnitude of the vector itself doubles as
+the old "signal" (kept as the `.signal` attribute below for every reward function
+that still reads it), so no separate slot is needed. Leg selection reads the same
+observable vector: dominant axis + its sign, threshold |cmd|>0.1 -- exactly the rule
+a real joystick-driven bench has to apply too, see b2_leg_lift_driver.py (kept in
+sync by hand, same convention as every other B2 skill driver in this repo).
+
+Direction mapping is the OWNER'S NEW spec for v8 (rotated one quadrant from v2/v7's
+own forward=FL mapping -- do not reuse the old LEG_DIRECTIONS table for this):
+  forward (+x) -> FR   right (-y) -> RR   back (-x) -> RL   left (+y) -> FL
+Sign convention: standard body-frame (+x forward, +y left) -- verified against this
+bench's own raw stick axes via b2_leg_lift_driver.py's predecessor (jump family
+already established vy>0=LEFT on this hardware), so no sign flip is needed anywhere
+in the chain: raw stick -> [vx, vy] -> training command, all the same signs.
+
+Breaks v7's "45-obs, forward/backward warm-start compatible" property (command
+width 3->2 means total obs 45->44) -- deliberate, not an oversight: the command
+INTERFACE itself changed, so there is nothing meaningful left to warm-start from.
+Trained from scratch, same as jump v6 and rear_stand v7 this same session.
 """
 
 import torch
@@ -34,77 +56,136 @@ import robot_lab.tasks.manager_based.locomotion.velocity.mdp as mdp
 
 from .rough_env_cfg import UnitreeB2RoughEnvCfg
 
-# Command timing -- first guess, calibrate from what training produces (same idiom as
-# every other first-guess constant in this repo, e.g. rear_stand's own RISE_DURATION).
-# Much faster than rear_stand's whole-body rise (2.0s): a single leg lifting is a far
-# smaller, lighter motion than rearing the whole robot up.
+# Command timing -- unchanged from v7 (never diagnosed as a problem; only the
+# reward economy and command interface are being redesigned this round).
 IDLE_TIME_RANGE = (1.5, 3.0)
 RISE_DURATION = 0.6
 HOLD_TIME_RANGE = (1.5, 3.0)
 DESCEND_DURATION = 0.6
-# 0.12 -> 0.15 (2026-08-12, user: the fold should be pronounced -- "вверх...
-# и сильнее" -- and with LIFT_XY_TOLERANCE now pinning the foot under the hip,
-# height can only come from a genuine upward fold).
-LIFT_HEIGHT_TARGET = 0.15  # m, foot clearance above the support tripod
-TRACKING_SIGMA = 0.01  # m^2, sharp -- clearance error is naturally small-scale (meters)
-# Own constant for leg_lift_selected_height's proximity_gate (2026-08-13 bench-monitor
-# autonomy fix, it11255/25000 of the gated-height v3 run): reusing TRACKING_SIGMA there
-# gave gate~0.6 at the observed steady-state excess (~0.06-0.10m, 3 straight ~1200-it
-# buckets sitting in the same 13-18cm band with reward/vloss no longer improving) --
-# not enough gradient to keep closing the gap. A SEPARATE constant lets the gate get
-# sharper WITHOUT also tightening height_kernel's own clearance-tracking tolerance
-# (an unrelated, currently-working part of the same reward term that happens to share
-# the old constant only by the docstring's own "same scale" convenience, not a real
-# coupling requirement). At excess=0 this changes nothing (exp(0)=1 regardless of
-# sigma) -- only genuinely swept-back feet get pushed harder.
-LIFT_XY_GATE_SIGMA = 0.004  # m^2, ~2.5x sharper than TRACKING_SIGMA
 
-# Direction unit vectors, FL/FR/RR/RL order -- matches _selected_leg_mask's own index
-# convention throughout this file. forward=FL, right=FR, back=RR, left=RL (user's own
-# spec, confirmed 2026-08-09 after the written spec's "left" line had a copy-paste typo
-# repeating FR).
-LEG_DIRECTIONS = ((1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0))
+# -- Rudin-style per-env height curriculum (v8, new) --
+# Starts at v7's old fixed LIFT_HEIGHT_TARGET (0.15) as the level-0 floor -- a value
+# already proven reachable by the v2/v7 lineage, so level 0 should not itself be a
+# struggle. MAX derived from thigh-link geometry (b2 URDF: FL_thigh_joint -> FL_calf
+# origin offset is 0.35m along the thigh) -- folding the whole leg up toward the hip
+# can geometrically put the foot within roughly one thigh-length of the hip's own
+# height, so 0.35m is the kinematic ceiling for "foot near body" as a CLEARANCE
+# figure; 0.30 leaves the same kind of headroom-from-singularity margin
+# STAND_HEIGHT_TARGET/REAR_LEG_EXTENSION_TARGET both used (an env that reaches 0.30m
+# consistently has essentially solved the task; there is little value in chasing the
+# literal kinematic limit). FIRST GUESS on the level step/tolerance/floor -- expect
+# postmortem-driven recalibration, same epistemic status as every other first-guess
+# constant in this file's own history.
+LIFT_HEIGHT_INIT = 0.15  # m, level-0 target (== v7's old fixed value)
+LIFT_HEIGHT_MIN = 0.05  # m, floor a failing env can regress to, never below
+LIFT_HEIGHT_MAX = 0.30  # m, ceiling -- see thigh-geometry comment above
+LIFT_HEIGHT_LEVEL_STEP = 0.02  # m, per-cycle bump on success
+LIFT_HEIGHT_LEVEL_DOWN = 0.006  # m, gentler per-cycle regression on failure (~30% of
+# the up-step -- Rudin-style asymmetry so one bad cycle doesn't erase several good
+# ones; still genuinely two-way, not monotonic-only)
+LIFT_HEIGHT_SUCCESS_TOL = 0.03  # m, |clearance - target| must stay under this for
+# EVERY step of the hold phase to count as a success this cycle (a strict, binary,
+# whole-hold criterion -- deliberately simple over a fractional/time-weighted one,
+# see leg_lift_env_cfg's own module docstring point 4)
+
+TRACKING_SIGMA = 0.01  # m^2, sharp -- clearance error is naturally small-scale (meters)
+LIFT_XY_GATE_SIGMA = 0.004  # m^2, ~2.5x sharper than TRACKING_SIGMA (see
+# leg_lift_selected_height's own docstring for the full "why a separate constant"
+# reasoning, unchanged from v7)
+LIFT_XY_TOLERANCE = 0.08  # m, unchanged from v7 -- proven fix for the backward-sweep
+# cheat (see leg_lift_selected_height/leg_lift_foot_horizontal docstrings)
+LIFT_BASE_HEIGHT_TARGET = 0.53  # m, unchanged from v7 -- rough's own standing target
+
+# -- v8 joint-fold anchor targets (new) --
+# "Оба сустава до уровня корпуса" (owner's spec) -- fold thigh+calf so the foot
+# tucks up near the hip, decoupled from pure world-Z clearance the same way
+# rear_stand_rear_leg_extension decoupled knee angle from root height (see that
+# function's own docstring for the precedent).
+#
+# Derived via the SAME forward-kinematics discipline STAND_HEIGHT_TARGET/
+# REAR_LEG_EXTENSION_TARGET both used (not copied from an untested guess): b2 URDF,
+# FL_thigh_joint rotates about local +Y, and its child (the calf's own origin) sits
+# at local (0, 0, -0.35) in the thigh's own frame at thigh_joint=0. Under a +Y
+# rotation by q1, that point moves to (-0.35*sin(q1), *, -0.35*cos(q1)) in the
+# thigh-origin frame -- at the default standing value (q1=0.8) this is
+# (-0.25, *, -0.24), i.e. hanging down-and-back, consistent with a normal standing
+# leg. Increasing q1 well past 0.8 rotates the same point up-and-back; at q1~pi/2
+# the thigh is roughly horizontal, and further increase starts lifting the knee
+# ABOVE the hip. thigh_joint's own URDF range is [-0.94, 4.69] -- unusually wide,
+# clearly built to allow exactly this fold-up range (nowhere near it for a normal
+# gait). Picked THIGH_FOLD_TARGET=2.4 rad (~137 deg) as a first-guess mid-fold: past
+# horizontal, meaningfully "up", well short of the 4.69 singularity (same
+# leave-headroom discipline as every other target constant here).
+#
+# calf_joint range is [-2.82, -0.43] (default -1.5); more-negative = knee bent
+# tighter (shank folded back toward the thigh). CALF_FOLD_TARGET=-2.5 folds the
+# shank most of the way toward its own limit, leaving ~0.32 rad margin from -2.82 --
+# needed so the whole assembly (thigh rotated up + calf folded back) stays compact
+# enough for the foot to actually end up NEAR the hip rather than swung out at the
+# end of a still-mostly-extended shank.
+#
+# Unlike rear_stand_rear_leg_extension (which stayed calf-only because thigh's sign
+# wasn't independently verified), BOTH joints are anchored here -- the FK derivation
+# above was carried out explicitly for this file rather than inherited unverified.
+# Still a FIRST GUESS on the exact numbers, same as the rest of this block; if this
+# term measurably fights the height/CoM objectives on the bench, thigh is the one to
+# revisit first (it carries the geometric assumption, calf's role is simpler).
+THIGH_FOLD_TARGET = 2.4  # rad
+CALF_FOLD_TARGET = -2.5  # rad
+
+# Direction mapping v8 (owner's spec, see module docstring) -- forward=FR, right=RR,
+# back=RL, left=FL. Order below is (dx, dy) per direction, used ONLY to pick which
+# canonical unit vector a newly-resampled cycle commands; leg SELECTION itself is
+# computed from the live command vector's own sign/dominance in _selected_leg_mask,
+# not by table lookup -- the two are guaranteed consistent by construction since
+# both encode the same forward/right/back/left semantics.
+CMD_DIRECTIONS = ((1.0, 0.0), (0.0, -1.0), (-1.0, 0.0), (0.0, 1.0))  # fwd,right,back,left
+CMD_ACTIVE_THRESHOLD = 0.1  # |cmd| below this reads as "no leg selected" (owner's
+# spec: "порог |cmd|>0.1") -- matches the bench driver's own STICK_DEADZONE-gated
+# ramp start, see b2_leg_lift_driver.py.
 
 # Explicit, ORDERED (FL,FR,RR,RL) name lists -- every per-leg-shaped reward function
-# below relies on this exact order matching LEG_DIRECTIONS/_selected_leg_mask's index
-# convention. SceneEntityCfg preserves an explicit list's order (unlike a regex, which
-# resolves in the articulation's own body-list order) -- same reliance every other
-# per-leg-ordered array in this codebase already makes (e.g. b2_policy.py's
-# leg_joint_names-driven qpos/qvel/ctrl address arrays on the bench side).
+# below relies on this exact order matching _selected_leg_mask's own index
+# convention. Unchanged from v7 (this ordering is independent of the v8 direction
+# mapping change above -- it's just "which array slot is which body", not "which
+# command means which leg").
 FOOT_BODY_NAMES = ["FL_calf", "FR_calf", "RR_calf", "RL_calf"]
 HIP_BODY_NAMES = ["FL_hip", "FR_hip", "RR_hip", "RL_hip"]
-# Lifted foot must stay horizontally near its own hip -- band before the penalty
-# bites. 0.2 -> 0.08 (2026-08-12, bench on 24999 WITH the fixed driver: every
-# direction now picks the right leg, but the "lift" is still a 10-15cm BACKWARD
-# sweep -- which sits entirely INSIDE the old 0.2 band, so the penalty never
-# fired once. 0.08 makes any sweep bite immediately; gaining clearance then
-# mechanically requires folding thigh+calf upward, which is the user's explicit
-# spec: "нужно не НАЗАД а ВВЕРХ... повернуть эти суставы в обратную сторону").
-LIFT_XY_TOLERANCE = 0.08
-# Base height anchor while a lift is commanded -- rough's own standing target.
-LIFT_BASE_HEIGHT_TARGET = 0.53
 LEG_JOINT_NAMES_ORDERED = [
     "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
     "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
     "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint",
     "RL_hip_joint", "RL_thigh_joint", "RL_calf_joint",
 ]  # fmt: skip
+# Index of each leg's THIGH/CALF slot within a [N,4,3] (leg, joint) view of
+# LEG_JOINT_NAMES_ORDERED-gathered joints -- (hip, thigh, calf) = (0, 1, 2).
+_THIGH_IDX, _CALF_IDX = 1, 2
 
 
 class LegLiftCommand(CommandTerm):
     """Cycle: idle (four legs) -> rise -> hold (one leg lifted) -> descend -> resample,
-    same clock trick as jump's JumpPulseCommand / rear_stand's RearStandCommand:
-    _resample_command overwrites the base class's time_left with the full cycle length.
-    Direction is picked once per cycle (which leg lifts) and held zero until rise starts,
-    same "idle reads as an honest all-zero command" idiom used everywhere else in this
-    repo (jump's own window-gated direction, rear_stand's ramp-gated walk/turn)."""
+    same clock trick as jump's JumpPulseCommand / rear_stand's RearStandCommand.
+
+    v8: the exposed `command` is now a genuine 2-slot (lin_vel_x, lin_vel_y) vector --
+    a fixed unit direction (picked once per cycle, held until descend completes, same
+    idiom as v7) scaled by the SAME 0->1->0 ramp v7 called `signal`. `.signal` is kept
+    as an attribute (== the vector's own magnitude) purely so every v7-era reward
+    function below that reads `term.signal` keeps working unmodified.
+
+    Also owns the v8 Rudin-style per-env height curriculum (`height_target`,
+    `_hold_success`, `_hold_entered`) -- see the module docstring's point 4 and
+    LIFT_HEIGHT_* constants above for the full mechanism. Bumped in
+    `_resample_command`, which IsaacLab's own CommandTerm.reset()/compute() already
+    call at every cycle boundary AND every episode reset (see
+    isaaclab/managers/command_manager.py) -- exactly the "per-env, success-gated,
+    not on a wall-clock schedule" hook Rudin's own recipe wants."""
 
     cfg: "LegLiftCommandCfg"
 
     def __init__(self, cfg: "LegLiftCommandCfg", env) -> None:
         super().__init__(cfg, env)
         n = self.num_envs
-        self._command = torch.zeros(n, 3, device=self.device)
+        self._command = torch.zeros(n, 2, device=self.device)
         self.signal = torch.zeros(n, device=self.device)
         self.direction = torch.zeros(n, 2, device=self.device)
         self.idle_duration = torch.zeros(n, device=self.device)
@@ -112,12 +193,26 @@ class LegLiftCommand(CommandTerm):
         self.cycle_duration = torch.zeros(n, device=self.device)
         self._directions = torch.tensor(cfg.directions, dtype=torch.float, device=self.device)
 
+        # -- v8 height curriculum state --
+        self.height_target = torch.full((n,), LIFT_HEIGHT_INIT, device=self.device)
+        self._hold_success = torch.ones(n, dtype=torch.bool, device=self.device)
+        self._hold_entered = torch.zeros(n, dtype=torch.bool, device=self.device)
+
+        # Cached body indices for the curriculum's own clearance check (FL,FR,RR,RL
+        # order, matching FOOT_BODY_NAMES/HIP_BODY_NAMES) -- resolved once here
+        # instead of going through SceneEntityCfg machinery, since this is purely
+        # internal bookkeeping, not a manager-registered term.
+        body_names = self._env.scene["robot"].body_names
+        self._foot_ids = [body_names.index(n) for n in FOOT_BODY_NAMES]
+        self._hip_ids = [body_names.index(n) for n in HIP_BODY_NAMES]
+
     @property
     def command(self) -> torch.Tensor:
         return self._command
 
     def _update_metrics(self):
         self.metrics["lift_signal"] = self.signal.clone()
+        self.metrics["height_target"] = self.height_target.clone()
 
     def _resample_command(self, env_ids):
         idle = torch.empty(len(env_ids), device=self.device).uniform_(*self.cfg.idle_time_range)
@@ -129,6 +224,26 @@ class LegLiftCommand(CommandTerm):
         dir_idx = torch.randint(0, self._directions.shape[0], (len(env_ids),), device=self.device)
         self.direction[env_ids] = self._directions[dir_idx]
 
+        # -- v8 height curriculum: judge the cycle that just ended BEFORE resetting
+        # the trackers for the new one. `_hold_entered` guards envs on their very
+        # first-ever resample (no hold phase has happened yet, nothing to judge).
+        # env_ids is always an index tensor here in practice (IsaacLab's top-level
+        # env reset resolves None to an explicit torch.arange before it ever reaches
+        # a command term -- the only other caller, compute()'s own resample_env_ids,
+        # is already a nonzero()-derived tensor), same assumption every other
+        # env_ids-indexed line in this class already makes.
+        judge = self._hold_entered[env_ids]
+        succeeded = judge & self._hold_success[env_ids]
+        failed = judge & ~self._hold_success[env_ids]
+        up_ids = env_ids[succeeded]
+        down_ids = env_ids[failed]
+        if len(up_ids) > 0:
+            self.height_target[up_ids] = (self.height_target[up_ids] + LIFT_HEIGHT_LEVEL_STEP).clamp(max=LIFT_HEIGHT_MAX)
+        if len(down_ids) > 0:
+            self.height_target[down_ids] = (self.height_target[down_ids] - LIFT_HEIGHT_LEVEL_DOWN).clamp(min=LIFT_HEIGHT_MIN)
+        self._hold_success[env_ids] = True
+        self._hold_entered[env_ids] = False
+
     def _update_command(self):
         elapsed = self.cycle_duration - self.time_left
         rise_start = self.idle_duration
@@ -137,9 +252,24 @@ class LegLiftCommand(CommandTerm):
         rising = ((elapsed - rise_start) / self.cfg.rise_duration).clamp(0.0, 1.0)
         descending = ((elapsed - descend_start) / self.cfg.descend_duration).clamp(0.0, 1.0)
         self.signal = rising - descending  # 0 idle, ramps up, holds 1, ramps down
-        self._command[:, 0] = self.signal
         active = (elapsed >= rise_start).float().unsqueeze(-1)
-        self._command[:, 1:3] = self.direction * active
+        self._command[:, 0:2] = self.direction * active * self.signal.unsqueeze(-1)
+
+        # -- v8 height curriculum: accumulate whole-hold success while actually
+        # holding. Uses the SAME clearance definition as leg_lift_selected_height
+        # (selected foot z minus the OTHER three's average z) so the curriculum
+        # judges the exact quantity the reward is tracking.
+        in_hold = (elapsed >= hold_start) & (elapsed < descend_start)
+        if torch.any(in_hold):
+            asset = self._env.scene["robot"]
+            foot_z = asset.data.body_pos_w[:, self._foot_ids, 2]
+            mask = _direction_to_leg_mask(self._command)
+            selected_z = (foot_z * mask).sum(dim=1)
+            support_z = (foot_z * (1.0 - mask)).sum(dim=1) / 3.0
+            clearance = selected_z - support_z
+            within_tol = (torch.abs(clearance - self.height_target) < LIFT_HEIGHT_SUCCESS_TOL)
+            self._hold_success = torch.where(in_hold, self._hold_success & within_tol, self._hold_success)
+            self._hold_entered = self._hold_entered | in_hold
 
 
 @configclass
@@ -150,24 +280,43 @@ class LegLiftCommandCfg(CommandTermCfg):
     rise_duration: float = RISE_DURATION
     hold_time_range: tuple[float, float] = HOLD_TIME_RANGE
     descend_duration: float = DESCEND_DURATION
-    directions: tuple = LEG_DIRECTIONS
+    directions: tuple = CMD_DIRECTIONS
     debug_vis: bool = False
 
 
-def _selected_leg_mask(env, command_name: str) -> torch.Tensor:
-    """[num_envs, 4] one-hot (FL,FR,RR,RL order) of which leg the command currently
-    selects, from the direction unit vector in command slots 1:3 (nearest by dot
-    product -- exact match by construction, argmax just avoids a brittle float-equality
-    check). Idle (direction=(0,0)) ties every dot product at 0 and argmax deterministically
-    returns index 0 (FL) -- harmless, every reward using this mask also multiplies by
-    lift_signal (0 at idle), so which leg nominally "wins" the idle tie never matters."""
-    term = env.command_manager.get_term(command_name)
-    direction = term.command[:, 1:3]
-    dirs = torch.tensor(LEG_DIRECTIONS, device=direction.device, dtype=direction.dtype)
-    idx = torch.argmax(direction @ dirs.T, dim=1)
-    mask = torch.zeros(direction.shape[0], 4, device=direction.device, dtype=direction.dtype)
+def _direction_to_leg_mask(command: torch.Tensor) -> torch.Tensor:
+    """[N,4] one-hot (FL,FR,RR,RL order) from a live (lin_vel_x, lin_vel_y) command,
+    by dominant-axis + sign -- v8's own rule (owner's spec: "выбор ноги по квадранту/
+    знаку доминирующей оси, порог |cmd|>0.1"), replacing v7's dot-product-against-a-
+    direction-table lookup (that table doesn't exist for the new interface -- the
+    magnitude IS the signal now, there is no separate unit-direction slot to compare
+    against). Below CMD_ACTIVE_THRESHOLD the tie resolves to index 0 (FL) -- same
+    harmless default as v7 (every caller also gates by `signal`/magnitude, which is
+    ~0 exactly when this tie can fire).
+
+    Mapping (owner's v8 spec): +x(fwd)->FR(1), -y(right)->RR(2), -x(back)->RL(3),
+    +y(left)->FL(0)."""
+    vx, vy = command[:, 0], command[:, 1]
+    x_dominant = torch.abs(vx) >= torch.abs(vy)
+    active = torch.linalg.norm(command, dim=-1) > CMD_ACTIVE_THRESHOLD
+    idx = torch.zeros(command.shape[0], dtype=torch.long, device=command.device)  # default FL
+    idx = torch.where(x_dominant & (vx > 0), torch.full_like(idx, 1), idx)  # forward -> FR
+    idx = torch.where(x_dominant & (vx <= 0), torch.full_like(idx, 3), idx)  # back -> RL
+    idx = torch.where(~x_dominant & (vy <= 0), torch.full_like(idx, 2), idx)  # right -> RR
+    idx = torch.where(~x_dominant & (vy > 0), torch.full_like(idx, 0), idx)  # left -> FL
+    idx = torch.where(active, idx, torch.zeros_like(idx))
+    mask = torch.zeros(command.shape[0], 4, device=command.device, dtype=command.dtype)
     mask.scatter_(1, idx.unsqueeze(-1), 1.0)
     return mask
+
+
+def _selected_leg_mask(env, command_name: str) -> torch.Tensor:
+    """Reward-function-facing wrapper around _direction_to_leg_mask -- fetches the
+    live command tensor from the named command term. Kept as a separate function
+    (v7 also had one under this exact name/signature) so every reward function below
+    that already calls `_selected_leg_mask(env, command_name)` needed zero changes."""
+    term = env.command_manager.get_term(command_name)
+    return _direction_to_leg_mask(term.command)
 
 
 def leg_lift_selected_height(
@@ -175,35 +324,19 @@ def leg_lift_selected_height(
     command_name: str,
     asset_cfg: SceneEntityCfg,
     hip_cfg: SceneEntityCfg,
-    target_lift: float,
     xy_tolerance: float,
 ) -> torch.Tensor:
     """Track the COMMANDED leg's foot clearance above the OTHER THREE's own average
-    height -- self-calibrating (relative to the live support tripod, not an absolute
-    world-Z guess), so it needs no ground-offset constant tuned by hand the way an
-    absolute-height anchor would. Target is target_lift*signal: 0 at idle (all four
-    flat), target_lift once fully commanded -- same signal-scaled-target idiom as
-    jump_idle_height / rear_stand_orientation_tracking.
+    height -- self-calibrating (relative to the live support tripod), unchanged
+    mechanism from v7. v8 change: the target is no longer a fixed constant -- it
+    reads `term.height_target`, the Rudin-style PER-ENV curriculum value (see
+    LegLiftCommand's own docstring), ramped by the same signal as before (0 at idle,
+    height_target once fully commanded).
 
-    GATED by horizontal proximity to the hip (added 2026-08-13, bench verdict on
-    30700/30900, TWO checkpoints AFTER the 2026-08-13-night support_pose loosening:
-    "поднимает ноги НАЗАД" -- STILL backward, unchanged). Root cause of why the
-    previous fix (loosening leg_lift_support_pose, and before that adding
-    leg_lift_foot_horizontal as an independent side-penalty) didn't work: height and
-    horizontal-excess were two SEPARATE additive terms competing on the SAME reward
-    sum, so the policy could keep paying foot_horizontal's penalty AS LONG AS the
-    height payout still won on net -- and back-calculating from the logged
-    foot_horizontal component (~-0.19 episode-average at lift_signal~0.58) puts the
-    actual sweep at roughly 0.30m past the hip, nowhere near the 0.08m tolerance.
-    Loosening support_pose only freed UP BUDGET for the policy to keep affording that
-    exact trade, it never made the trade itself unprofitable.
-
-    Fix: multiply the height kernel by a horizontal-proximity gate instead of merely
-    penalizing distance alongside it -- collecting ANY height credit now REQUIRES the
-    foot to already be near the hip, so there is no longer a "pay the penalty, keep
-    the height" trade to make; sweeping the leg back earns ~0 on BOTH terms at once.
-    leg_lift_foot_horizontal is kept alongside as a second, independent deterrent
-    (belt-and-suspenders), not relied on alone this time."""
+    GATED by horizontal proximity to the hip (v7 fix, kept verbatim -- see git
+    history for the original diagnosis: height credit requires the foot to already
+    be near the hip, so sweeping the leg back earns ~0 on both this and
+    leg_lift_foot_horizontal at once)."""
     term = env.command_manager.get_term(command_name)
     asset = env.scene["robot"]
     foot_z = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]  # [N,4], FL,FR,RR,RL order
@@ -211,7 +344,7 @@ def leg_lift_selected_height(
     selected_z = (foot_z * mask).sum(dim=1)
     support_z = (foot_z * (1.0 - mask)).sum(dim=1) / 3.0
     clearance = selected_z - support_z
-    target = target_lift * term.signal
+    target = term.height_target * term.signal
     height_kernel = torch.exp(-torch.square(clearance - target) / TRACKING_SIGMA)
 
     foot_xy = asset.data.body_pos_w[:, asset_cfg.body_ids, 0:2]
@@ -219,11 +352,6 @@ def leg_lift_selected_height(
     dist = torch.linalg.norm(foot_xy - hip_xy, dim=-1)  # [N,4]
     selected_dist = (dist * mask).sum(dim=1)
     excess = (selected_dist - xy_tolerance).clamp(min=0.0)
-    # LIFT_XY_GATE_SIGMA (own constant, see its own comment above -- 2026-08-13,
-    # sharpened from the height_kernel's shared TRACKING_SIGMA once that proved too
-    # forgiving at the observed steady-state excess): at a genuine near-hip fold
-    # (<0.08m, excess=0) this is exactly 1.0 regardless of sigma and never discounts
-    # an honest lift; it only sharpens the falloff for genuinely swept-back feet.
     proximity_gate = torch.exp(-torch.square(excess) / LIFT_XY_GATE_SIGMA)
 
     return height_kernel * proximity_gate
@@ -231,9 +359,8 @@ def leg_lift_selected_height(
 
 def leg_lift_support_contact(env, command_name: str, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
     """Penalize the THREE support feet losing contact while a lift is actually
-    commanded -- the tripod must stay a genuine tripod, not drift into a fourth
-    free-floating configuration nothing else prices. Gated by lift_signal (no penalty
-    during idle/ramp-in) since only a full lift actually demands 3-point support."""
+    commanded. Unchanged from v7 -- only depends on `_selected_leg_mask`/`term.signal`,
+    both still present under the v8 interface."""
     term = env.command_manager.get_term(command_name)
     contact_sensor = env.scene.sensors[sensor_cfg.name]
     forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]
@@ -247,17 +374,8 @@ def leg_lift_foot_horizontal(
     env, command_name: str, foot_cfg: SceneEntityCfg, hip_cfg: SceneEntityCfg, tolerance: float
 ) -> torch.Tensor:
     """Penalty on the LIFTED foot's horizontal distance from its own hip beyond a
-    tolerance band -- "поднять" means fold the leg UP under the hip, not sweep it
-    away. Added 2026-08-11 (bench verdict on model_7999: the one leg that responds
-    at all (RR) pulls BACKWARD instead of up -- leg_lift_selected_height prices
-    only the VERTICAL clearance, so where the foot goes horizontally was a free
-    variable, and swinging the leg back happens to be the physically cheapest way
-    to gain a little clearance. The master free-variable lesson, instance N.)
-
-    Distance measured hip-to-foot in the horizontal plane (both from live body
-    poses, so it's orientation-robust), excess over the band squared, clamped
-    (same bounded-worst-case discipline as every clamped term in jump_env_cfg),
-    masked to the commanded leg, scaled by the lift signal."""
+    tolerance band. Unchanged from v7 -- see leg_lift_selected_height's own docstring
+    for why this pairs with the proximity gate as belt-and-suspenders."""
     term = env.command_manager.get_term(command_name)
     asset = env.scene["robot"]
     foot_xy = asset.data.body_pos_w[:, foot_cfg.body_ids, 0:2]  # [N,4,2] FL,FR,RR,RL
@@ -270,15 +388,7 @@ def leg_lift_foot_horizontal(
 
 
 def leg_lift_base_height(env, command_name: str, target_height: float) -> torch.Tensor:
-    """L2 base-height anchor active while a lift is commanded. Added 2026-08-11
-    (bench verdict on model_7999: "сильно приседает" during the RR lift). Root
-    cause: rough's own base_height_l2 is weight-0 in the parent config, and this
-    file's support_pose penalty was the ONLY thing opposing a squat -- at -2.0 vs
-    the height reward's +6.0, crouching (which lowers the CoM and makes the
-    3-legged balance easier) was a cheap trade. Nothing anchored the base height
-    at all -- the same free-variable hole jump_idle_height plugged for the jump
-    task, plugged the same way here. Scaled by the lift signal: idle keeps its
-    own anchors (upward + the retired-generic-terms replacement below)."""
+    """L2 base-height anchor active while a lift is commanded. Unchanged from v7."""
     term = env.command_manager.get_term(command_name)
     asset = env.scene["robot"]
     err = torch.square(asset.data.root_pos_w[:, 2] - target_height)
@@ -286,14 +396,8 @@ def leg_lift_base_height(env, command_name: str, target_height: float) -> torch.
 
 
 def leg_lift_base_still(env, command_name: str) -> torch.Tensor:
-    """Penalty on horizontal base velocity + yaw rate, active in EVERY phase
-    (added 2026-08-12, bench on 24999: the robot backpedals slowly during a
-    commanded lift). Nothing in this task ever priced base translation --
-    track_lin_vel/track_ang_vel are retired, stand_still_without_cmd is
-    zeroed, and the whole task is defined as "stand in place and lift one
-    leg" -- so pacing around was a free variable from day one (the same hole
-    jump_idle_still plugged for the jump task; here the robot should never
-    translate at all, so no phase gate)."""
+    """Penalty on horizontal base velocity + yaw rate, active in EVERY phase.
+    Unchanged from v7."""
     asset = env.scene["robot"]
     v_xy = torch.sum(torch.square(asset.data.root_lin_vel_w[:, 0:2]), dim=1)
     w_z = torch.square(asset.data.root_ang_vel_w[:, 2])
@@ -302,30 +406,8 @@ def leg_lift_base_still(env, command_name: str) -> torch.Tensor:
 
 def leg_lift_support_pose(env, command_name: str, asset_cfg: SceneEntityCfg) -> torch.Tensor:
     """L1 penalty on joint deviation from default, masked to the THREE support legs
-    only -- the lifted leg's own joints must stay free to move (that's the whole
-    trick), everything else should hold the plain stand exactly like idle does.
-
-    Written in up front rather than discovered later on a bench test: this is the SAME
-    class of bug as today's jump/rear_stand idle-pose regressions (see
-    jump_idle_symmetry's own docstring in jump_env_cfg.py) -- the generic
-    stand_still_without_cmd/joint_pos_penalty terms gate on command-NORM, all-or-
-    nothing, so they'd fully deactivate for the entire duration of every lift (command
-    is nonzero the moment a direction is picked) and leave the three support legs'
-    pose completely unpriced exactly when it matters most. Zeroed those two generic
-    terms in __post_init__ in favor of this one, correctly-masked, always-active
-    anchor instead of leaving that gap for a checkpoint to drift into.
-
-    v4 (2026-08-14, bench verdict on 20200): the exemption is now SCALED BY THE LIFT
-    SIGNAL (`1 - mask*signal`) instead of binary (`1 - mask`). The binary version had
-    exactly the hole the paragraph above tried to close, one leg over: at IDLE the
-    command direction is (0,0), argmax resolves the tie to FL by default, so FL was
-    permanently exempt from the anchor while standing -- and the checkpoint drifted
-    into the bench-observed "FL stretched forward, body tilted ~10°, weird half-crouch"
-    idle pose, plus the "кульбит" (the policy re-staged its front-leg stance per
-    command, since stance re-arrangement was free). With signal-scaling, at signal=0
-    ALL FOUR legs are anchored (symmetric rest is the only cheap pose), and the
-    selected leg earns its freedom exactly in proportion to how far the lift has
-    actually been commanded."""
+    only, exemption scaled by the lift signal (v4-era fix, kept). Unchanged from v7
+    -- see git history for the full idle-drift/"кульбит" diagnosis this fixed."""
     term = env.command_manager.get_term(command_name)
     asset = env.scene["robot"]
     diff = torch.abs(
@@ -338,6 +420,88 @@ def leg_lift_support_pose(env, command_name: str, asset_cfg: SceneEntityCfg) -> 
     return torch.sum(support_diff, dim=(1, 2))
 
 
+def leg_lift_com_over_support(env, command_name: str, foot_cfg: SceneEntityCfg) -> torch.Tensor:
+    """v8 NEW. Base XY centered over the CENTROID of the three SUPPORT feet (not a
+    fixed pair, and not all four) -- the fault-tolerant-locomotion mechanism the task
+    doc points at (arXiv:2606.25965, MoE RL/IsaacLab/Go2): with one leg lifted, three
+    feet is the entire base of support, and the CoM belongs inside that triangle.
+    Sibling of rear_stand_com_over_support (same exp(-8*err) kernel, same reasoning),
+    generalized from a 2-foot midpoint to a 3-foot centroid via the same per-env
+    selection mask every other function in this file already uses. Gated on the lift
+    signal actually being underway (idle = 4-leg support, the CoM belongs centered
+    over all four, not one particular triangle)."""
+    term = env.command_manager.get_term(command_name)
+    asset = env.scene["robot"]
+    foot_xy = asset.data.body_pos_w[:, foot_cfg.body_ids, 0:2]  # [N,4,2] FL,FR,RR,RL
+    mask = _selected_leg_mask(env, command_name)
+    support_centroid = (foot_xy * (1.0 - mask).unsqueeze(-1)).sum(dim=1) / 3.0
+    base_xy = asset.data.root_pos_w[:, 0:2]
+    err = torch.sum(torch.square(base_xy - support_centroid), dim=1)
+    return torch.exp(-8.0 * err) * term.signal
+
+
+def leg_lift_feet_on_air(env, command_name: str, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
+    """v8 NEW. Positive one-shot bonus the instant the SELECTED leg leaves the
+    ground, ported from unitree_a1_handstand's own handstand_feet_on_air. Their
+    version uses a static body subset (torch.all across a fixed set of feet meant to
+    be airborne); here the "which foot" varies per env, so first_air is computed for
+    all four and reduced through the same per-env selection mask as every other
+    function in this file, instead of torch.all over a fixed subset.
+
+    Gated on signal>0.5 (same threshold rear_stand_front_feet_on_air uses) rather
+    than any nonzero signal, so a brief noise-triggered liftoff during the rise ramp
+    isn't credited the same as a genuine held lift."""
+    term = env.command_manager.get_term(command_name)
+    contact_sensor = env.scene.sensors[sensor_cfg.name]
+    first_air = contact_sensor.compute_first_air(env.step_dt)[:, sensor_cfg.body_ids].float()  # [N,4]
+    mask = _selected_leg_mask(env, command_name)
+    reward = (first_air * mask).sum(dim=1)
+    risen = (term.signal > 0.5).float()
+    return reward * risen
+
+
+def leg_lift_feet_air_time(env, command_name: str, sensor_cfg: SceneEntityCfg, threshold: float) -> torch.Tensor:
+    """v8 NEW. Rewards sustained air time on the SELECTED leg past `threshold`,
+    ported from unitree_a1_handstand's own handstand_feet_air_time, same per-env
+    masking as leg_lift_feet_on_air above (their static-subset torch.sum over a
+    fixed set of feet becomes a masked sum over whichever leg this env's command
+    actually selected)."""
+    term = env.command_manager.get_term(command_name)
+    contact_sensor = env.scene.sensors[sensor_cfg.name]
+    first_contact = contact_sensor.compute_first_contact(env.step_dt)[:, sensor_cfg.body_ids]
+    last_air_time = contact_sensor.data.last_air_time[:, sensor_cfg.body_ids]
+    reward_all = (last_air_time - threshold) * first_contact.float()
+    mask = _selected_leg_mask(env, command_name)
+    return (reward_all * mask).sum(dim=1)
+
+
+def leg_lift_joint_fold(env, command_name: str, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """v8 NEW. Secondary joint-angle anchor: exp-tracking of the SELECTED leg's
+    thigh+calf toward (THIGH_FOLD_TARGET, CALF_FOLD_TARGET) -- "foot folded up near
+    the body", decoupled from the pure world-Z clearance leg_lift_selected_height
+    already owns, same "two co-objectives, not one proxy for the other" structure as
+    rear_stand_rear_leg_extension alongside rear_stand_front_feet_height. Ramped by
+    the same signal (default pose at idle, fold target once fully commanded), masked
+    to the selected leg only via the same per-env mask as every other function here
+    -- the three support legs' own thigh/calf stay governed by leg_lift_support_pose
+    instead, so there is no double-anchoring."""
+    term = env.command_manager.get_term(command_name)
+    asset = env.scene["robot"]
+    joint_pos = asset.data.joint_pos[:, asset_cfg.joint_ids].view(-1, 4, 3)  # [N,leg,joint]
+    default = asset.data.default_joint_pos[:, asset_cfg.joint_ids].view(-1, 4, 3)
+    fold_target = default.clone()
+    fold_target[:, :, _THIGH_IDX] = THIGH_FOLD_TARGET
+    fold_target[:, :, _CALF_IDX] = CALF_FOLD_TARGET
+    signal = term.signal.view(-1, 1, 1)
+    target = default + (fold_target - default) * signal
+    err = torch.sum(
+        torch.square(joint_pos[:, :, _THIGH_IDX:_CALF_IDX + 1] - target[:, :, _THIGH_IDX:_CALF_IDX + 1]), dim=2
+    )  # [N,4]
+    kernel = torch.exp(-err / TRACKING_SIGMA)
+    mask = _selected_leg_mask(env, command_name)
+    return (kernel * mask).sum(dim=1)
+
+
 class UnitreeB2LegLiftRoughEnvCfg(UnitreeB2RoughEnvCfg):
     """See module docstring -- a deliberately simple test skill, not a production one."""
 
@@ -345,43 +509,28 @@ class UnitreeB2LegLiftRoughEnvCfg(UnitreeB2RoughEnvCfg):
         # post init of parent
         super().__post_init__()
 
-        # Flat ground -- same reasoning as jump_env_cfg's own: the trick is plenty hard
-        # without rough terrain on top, revisit later if this graduates past "test".
+        # Flat ground -- unchanged reasoning from v7: the trick is plenty hard
+        # without rough terrain on top.
         self.scene.terrain.terrain_type = "plane"
         self.scene.terrain.terrain_generator = None
         self.curriculum.terrain_levels = None
 
-        # The lift command replaces the velocity command wholesale (same 3 slots, so
-        # the observation layout -- and warm-start compatibility with any plain 45-obs
-        # checkpoint -- is unchanged).
+        # The lift command replaces the velocity command wholesale. v8: now 2 slots
+        # (lin_vel_x, lin_vel_y), not v7's 3 -- see module docstring.
         self.commands.base_velocity = LegLiftCommandCfg()
-        # command_levels_vel reads `.cfg.ranges` off the base_velocity term -- this
-        # command has no ranges, same non-applicability as jump's own pulse command.
         self.curriculum.command_levels = None
-
-        # v7 (2026-08-16): the v6 illegal_contact termination is REMOVED again --
-        # back to v2's exact termination set (time_out/out_of_bounds only). It was
-        # added to price the v5/v6 rear-command collapses, but v7 warm-starts from
-        # v2's 24999, which never collapsed on the bench; keeping a termination the
-        # base policy never trained under would be a gratuitous distribution shift
-        # ("небольшими порциями, чтобы не запутать PPO" -- owner's staging order).
 
         # -- retire the velocity-tracking recipe, same as every other non-gait B2 variant
         self.rewards.track_lin_vel_xy_exp.weight = 0
         self.rewards.track_ang_vel_z_exp.weight = 0
 
-        # Not a periodic gait (feet_air_time/feet_gait/feet_contact/feet_slide/
-        # feet_stumble already default to 0 in rough_env_cfg, nothing to retire there).
-        # feet_height/feet_height_body are generic ALL-feet swing-clearance terms
-        # (walking-gait-shaped) -- retired in favor of leg_lift_selected_height below,
-        # which is specific to exactly the one commanded leg.
+        # Not a periodic gait -- feet_height/feet_height_body retired in favor of
+        # leg_lift_selected_height, which is specific to the one commanded leg.
         self.rewards.feet_height.weight = 0
         self.rewards.feet_height_body.weight = 0
 
-        # Single-leg lift is inherently an ASYMMETRIC motion (one leg moves, its
-        # diagonal partner does not) -- joint_mirror (rough default -0.05, rewards
-        # symmetry between diagonal FR<->RL / FL<->RR pairs) would directly fight the
-        # entire point of this task.
+        # Single-leg lift is inherently ASYMMETRIC -- joint_mirror would directly
+        # fight the entire point of this task.
         self.rewards.joint_mirror.weight = 0
 
         # See leg_lift_support_pose's own docstring for why these two generic terms
@@ -389,100 +538,38 @@ class UnitreeB2LegLiftRoughEnvCfg(UnitreeB2RoughEnvCfg):
         self.rewards.stand_still_without_cmd.weight = 0
         self.rewards.joint_pos_penalty.weight = 0
 
-        # v4 (2026-08-14, bench verdict on checkpoint 20200 -- owner's live test +
-        # frame review; TRAINING_STATE.md entry ~01:40 for the full story):
-        # - flat_orientation_l2 0 -> -5.0: "ровный корпус ВСЕГДА" (owner's explicit
-        #   rule). The bench-observed steady ~10° body tilt was nearly free: `upward`
-        #   rewards the z-projection (cos(10°)≈0.985, costs ~1.5%), ang_vel_xy_l2
-        #   prices rotation SPEED not static tilt. L2 on gravity-xy makes a standing
-        #   tilt cost real reward while the small transient lean a lift genuinely
-        #   needs stays cheap (10° -> ~0.03 raw).
-        # - feet_slide 0 -> -0.5: feet dragging while IN CONTACT. Prices both halves
-        #   of the bench verdict at once: the "кульбит" (front feet re-staging under a
-        #   new command = stepping/sliding in place) and the rear feet's horizontal
-        #   crawl-instead-of-lift (harness frames 0066/0093: RR/RL slide along the
-        #   floor, never leave it).
-        # v5 (2026-08-14, v4 ran full 25000 it -- lift never emerged, see
-        # TRAINING_STATE.md entry 16:01/20:32 for the full diagnosis): v4's own
-        # signal-scaled support_pose exemption fixed the idle-tilt bug it targeted,
-        # but STRUCTURALLY it now anchors all 4 legs at idle (was 3 -- FL used to be
-        # permanently exempt from the old binary-mask bug) on top of these two NEW
-        # universal costs, which fire at idle too -- attempting a lift got
-        # measurably more expensive to try than it was in v2/v3, where support_pose
-        # already had to be loosened once for exactly this "economic wall" symptom
-        # (weight history below). Haircut both by ~30%, not zeroed -- "ровный
-        # корпус ВСЕГДА" stays enforced at idle, just less punishing while a leg is
-        # actually mid-lift and the other three legitimately need to shift for
-        # balance (see leg_lift_support_pose's own -4.0->-3.0 comment: that shift
-        # is a PHYSICAL requirement of a real lift, not the cheating this pair was
-        # built to catch).
-        # v7 (2026-08-16, owner's staging order: "возвращаемся к v2-24999 базе,
-        # делаем частями, небольшими порциями, чтобы не запутать PPO"): the
-        # v4/v5 universal costs are RETIRED back to v2's zero -- they were built
-        # for v4's own goals, and the v4-v6 line demonstrably destroyed the
-        # working v2 behavior (correct leg choice, clean lift attempt) without
-        # fixing anything. v7 = v2 economy + ONLY the backward-sweep fix package
-        # (tolerance 0.08 + proximity gate + base_still), warm-started from
-        # v2's own model_24999. Obs layout untouched (45) -- full checkpoint
-        # compatibility forward and back.
-        self.rewards.flat_orientation_l2.weight = 0
-        self.rewards.feet_slide.weight = 0
+        # v7 values, kept as-is for v8 -- "ровный корпус ВСЕГДА" (owner's rule) plus
+        # the feet_slide fix for the idle-tilt/"кульбит" and dragging-instead-of-
+        # lifting symptoms; both proven on the v2/v7 lineage, not touched by this
+        # round's redesign (which targets the missing POSITIVE mechanisms, not this
+        # pair).
+        self.rewards.flat_orientation_l2.weight = -5.0
+        self.rewards.feet_slide.weight = -0.5
 
-        # -- the lift objective itself
+        # -- the lift objective itself (v7 mechanism, v8 per-env curriculum target)
         self.rewards.leg_lift_selected_height = RewTerm(
             func=leg_lift_selected_height,
             weight=6.0,
             params={
                 "command_name": "base_velocity",
-                # preserve_order=True is load-bearing: without it SceneEntityCfg
-                # resolves body_ids in the ARTICULATION's own native order, not
-                # FOOT_BODY_NAMES's -- every per-leg function in this file relies on
-                # index 0..3 meaning FL,FR,RR,RL specifically (see LEG_DIRECTIONS).
                 "asset_cfg": SceneEntityCfg("robot", body_names=FOOT_BODY_NAMES, preserve_order=True),
-                # 2026-08-13: hip_cfg + xy_tolerance -- height reward is now GATED by
-                # horizontal proximity to the hip (see the function's own docstring
-                # for why the earlier side-penalty-only approach didn't stop the
-                # backward sweep).
                 "hip_cfg": SceneEntityCfg("robot", body_names=HIP_BODY_NAMES, preserve_order=True),
-                "target_lift": LIFT_HEIGHT_TARGET,
                 "xy_tolerance": LIFT_XY_TOLERANCE,
             },
         )
         self.rewards.leg_lift_support_contact = RewTerm(
             func=leg_lift_support_contact,
-            # -3.0 -> -6.0 (v6, 2026-08-15, sequence-frame review of the v5 20700
-            # run): under a FORWARD (FL) command the policy lifts FR -- its one
-            # practiced leg -- instead. That wrong-leg lift earns ~0 from
-            # selected_height (the commanded FL stays planted, clearance 0) but at
-            # -3.0 the support-contact price for floating FR was evidently cheap
-            # enough to shrug off. Doubled so "reuse the favorite leg" is clearly
-            # net-negative and the only profitable clearance is the commanded
-            # leg's own. Bounded by construction (<= 3 feet missing).
-            # -6.0 -> -3.0 (v7, 2026-08-16): back to the exact v2 value -- the
-            # -6.0 belonged to the failed v6 experiment; v7 warm-starts from
-            # v2's own 24999, which already picks the CORRECT leg on all four
-            # commands (owner-verified live), so the wrong-leg problem this
-            # doubling targeted does not exist in the starting policy.
             weight=-3.0,
             params={
                 "command_name": "base_velocity",
-                # See leg_lift_selected_height's own comment -- preserve_order=True
-                # is load-bearing here too, same FL,FR,RR,RL convention.
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=FOOT_BODY_NAMES, preserve_order=True),
             },
         )
-        # New 2026-08-12 (bench on 24999: slow backpedal during the lift -- see
-        # leg_lift_base_still's own docstring). Same weight scale as the other
-        # tasks' own idle-stillness terms (-2.0..-3.0 on the same v²+w² unit).
         self.rewards.leg_lift_base_still = RewTerm(
             func=leg_lift_base_still,
             weight=-2.0,
             params={"command_name": "base_velocity"},
         )
-        # New 2026-08-11 (bench: the lifted leg pulls BACKWARD, not up -- see
-        # leg_lift_foot_horizontal's own docstring). Weight matched to the height
-        # reward's own +6.0: gaining clearance by sweeping the leg away must never
-        # net positive.
         self.rewards.leg_lift_foot_horizontal = RewTerm(
             func=leg_lift_foot_horizontal,
             weight=-6.0,
@@ -493,9 +580,6 @@ class UnitreeB2LegLiftRoughEnvCfg(UnitreeB2RoughEnvCfg):
                 "tolerance": LIFT_XY_TOLERANCE,
             },
         )
-        # New 2026-08-11 (bench: deep squat during the lift -- see
-        # leg_lift_base_height's own docstring). Same weight scale as
-        # jump_idle_height's own -8.0 anchor (same L2-on-root-z unit).
         self.rewards.leg_lift_base_height = RewTerm(
             func=leg_lift_base_height,
             weight=-8.0,
@@ -503,42 +587,65 @@ class UnitreeB2LegLiftRoughEnvCfg(UnitreeB2RoughEnvCfg):
         )
         self.rewards.leg_lift_support_pose = RewTerm(
             func=leg_lift_support_pose,
-            # -2.0 -> -4.0 (2026-08-11, bench: squat + general support sloppiness --
-            # at -2.0 vs the height reward's +6.0 the support stance was too cheap
-            # to abandon; leg_lift_base_height now owns the squat specifically, this
-            # owns the joint-level stance).
-            # -4.0 -> -3.0 (2026-08-13 night, leg_lift v2 run: selected_height
-            # plateaued hard at ~4.05-4.10/6.0 for 6 consecutive half-hour checks
-            # (~3h) with noise_std still rising, not settling -- not a converged
-            # local optimum, a genuine economic wall. Hypothesis: reaching higher
-            # clearance under the sharp exp kernel (TRACKING_SIGMA=0.01) forces the
-            # three support legs to shift for balance/weight compensation -- a
-            # physically necessary part of a HIGH lift, not the cheating this term
-            # was built to catch (that's foot_horizontal/base_height's job,
-            # untouched here). Loosened, not zeroed -- support legs still owe a
-            # recognizable stance, just cheaper to compensate from.
-            # -3.0 -> -2.0 (2026-08-14, v4 ran the full 25000 it: selected_height
-            # NEVER moved off 3.6-3.9/6.0, flat the entire run -- not a slow climb
-            # that needed more time, a genuine standing plateau (see TRAINING_STATE.md
-            # 20:32 for the bucketed evidence). Same "economic wall" symptom as the
-            # -4.0->-3.0 loosening above, but v4 made the wall taller than v2/v3 had
-            # it WITHOUT changing this number: it now anchors all 4 legs at idle
-            # (was 3) plus the two new universal costs below -- continuing the same
-            # lever that already worked twice.
-            # -2.0 -> -4.0 (v7, 2026-08-16): back to the exact v2 value. Both
-            # loosenings above belonged to the v3-v6 line that never reproduced
-            # v2's clean behavior; v7 restores the economy the working 24999 was
-            # actually trained under (the ONE deliberate carry-over: the
-            # signal-scaled exemption replacing v2's binary mask -- pure idle-time
-            # bugfix, identical math during an active lift, prevents the
-            # bench-proven FL-idle-drift/кульбит channel).
             weight=-4.0,
             params={
                 "command_name": "base_velocity",
-                # preserve_order=True -- this function's .view(N, 4, 3) reshape
-                # assumes joint_ids comes back grouped FL/FR/RR/RL in exactly
-                # LEG_JOINT_NAMES_ORDERED's order, not the articulation's native one.
                 "asset_cfg": SceneEntityCfg("robot", joint_names=LEG_JOINT_NAMES_ORDERED, preserve_order=True),
+            },
+        )
+
+        # -- v8 NEW terms --
+        # Fault-tolerant CoM-over-support-triangle: the main balance mechanism this
+        # task needs (task doc: "главный и почти единственный балансный терм"),
+        # weighted just under the height objective itself (6.0) since it is a
+        # co-primary requirement, not a minor backstop.
+        self.rewards.leg_lift_com_over_support = RewTerm(
+            func=leg_lift_com_over_support,
+            weight=5.0,
+            params={
+                "command_name": "base_velocity",
+                "foot_cfg": SceneEntityCfg("robot", body_names=FOOT_BODY_NAMES, preserve_order=True),
+            },
+        )
+        # Secondary joint-fold anchor -- see leg_lift_joint_fold's own docstring.
+        # Weighted below the two co-primary terms (height 6.0, CoM 5.0) since it is
+        # explicitly a secondary/decoupling anchor, same relative positioning
+        # rear_stand_rear_leg_extension (6.0) had under rear_stand_front_feet_height
+        # (10.0)/rear_stand_com_over_support (2.0) in that file.
+        self.rewards.leg_lift_joint_fold = RewTerm(
+            func=leg_lift_joint_fold,
+            weight=4.0,
+            params={
+                "command_name": "base_velocity",
+                "asset_cfg": SceneEntityCfg("robot", joint_names=LEG_JOINT_NAMES_ORDERED, preserve_order=True),
+            },
+        )
+        # Positive air package -- task doc calls these "дешёвые термы" (cheap terms):
+        # they price the FACT/DURATION of the leg actually leaving the ground, which
+        # nothing else here does (selected_height only prices clearance once
+        # airborne, not the transition itself). Weighted well under the co-primary
+        # pair, same relative scale rear_stand's own front_feet_on_air/air_time
+        # (5.0/5.0) had under its dominant front_feet_height (10.0).
+        self.rewards.leg_lift_feet_on_air = RewTerm(
+            func=leg_lift_feet_on_air,
+            weight=3.0,
+            params={
+                "command_name": "base_velocity",
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=FOOT_BODY_NAMES, preserve_order=True),
+            },
+        )
+        self.rewards.leg_lift_feet_air_time = RewTerm(
+            func=leg_lift_feet_air_time,
+            weight=3.0,
+            params={
+                "command_name": "base_velocity",
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=FOOT_BODY_NAMES, preserve_order=True),
+                # Hold windows are 1.5-3.0s (HOLD_TIME_RANGE) -- 1.0s threshold asks
+                # for a genuinely SUSTAINED lift (not just a touch-and-go), same
+                # "scaled to this task's own hold window" reasoning
+                # rear_stand_front_feet_air_time's own threshold=3.0 used against
+                # rear_stand's much longer 8-14s hold_time_range. FIRST GUESS.
+                "threshold": 1.0,
             },
         )
 
