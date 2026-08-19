@@ -35,6 +35,18 @@ class UnitreeB2RoughPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
 
 @configclass
+class UnitreeB2WalkPPORunnerCfg(UnitreeB2RoughPPORunnerCfg):
+    def __post_init__(self):
+        super().__post_init__()
+
+        # Own logs/rsl_rl/unitree_b2_walk/ directory -- same network/obs/action shapes
+        # as stock rough (walk_env_cfg.py only turns on gait-rhythm reward weights,
+        # nothing structural), so a stock-rough walking checkpoint can warm-start this
+        # run (same recipe as crawl/rear_stand's own note above).
+        self.experiment_name = "unitree_b2_walk"
+
+
+@configclass
 class UnitreeB2FlatPPORunnerCfg(UnitreeB2RoughPPORunnerCfg):
     def __post_init__(self):
         super().__post_init__()
@@ -122,6 +134,20 @@ class UnitreeB2LegLiftPPORunnerCfg(UnitreeB2RoughPPORunnerCfg):
         # post-convergence; the front lifts need a trained CoM shift backward on top
         # of everything else, which is exactly the expensive part).
         self.max_iterations = 20000
+
+        # entropy_coef 0.01 -> 0.005 (2026-08-13, bench-monitor autonomy fix, v3b
+        # gated-height run): the SAME isolated action_rate_l2/vloss blow-up pattern
+        # already fixed this way for jump (2026-08-08) and rear_stand v4 (2026-08-10)
+        # -- reward/episode_length recover on their own within ~100-300 iterations
+        # each time (elen never dropped below 1000 across either episode, confirmed
+        # line-by-line), but the pattern RECURRED and grew worse across two
+        # consecutive 30-min monitoring checks (worst single-iteration reward -111 ->
+        # -231.6, worst vloss 6.79 -> 8.52) rather than staying at a stable severity.
+        # Leg-lift was the one task in this family that never got this fix. Halving
+        # the entropy bonus should let exploration settle instead of repeatedly
+        # re-triggering these spikes. Leg-lift-only override -- doesn't touch rough/
+        # crawl/vision's own entropy_coef.
+        self.algorithm.entropy_coef = 0.005
 
 
 @configclass

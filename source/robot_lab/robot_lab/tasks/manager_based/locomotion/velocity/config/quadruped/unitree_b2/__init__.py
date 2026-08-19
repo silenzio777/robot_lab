@@ -32,6 +32,19 @@ gym.register(
 )
 
 gym.register(
+    id="RobotLab-Isaac-Velocity-Rough-Unitree-B2-Walk-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.walk_env_cfg:UnitreeB2WalkRoughEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeB2WalkPPORunnerCfg",
+        # cusrl isn't part of this project's actual training pipeline -- see Crawl's
+        # own comment below for why this reuses the rough variant's entry.
+        "cusrl_cfg_entry_point": f"{agents.__name__}.cusrl_ppo_cfg:UnitreeB2RoughTrainerCfg",
+    },
+)
+
+gym.register(
     id="RobotLab-Isaac-Velocity-Rough-Unitree-B2-Crawl-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
