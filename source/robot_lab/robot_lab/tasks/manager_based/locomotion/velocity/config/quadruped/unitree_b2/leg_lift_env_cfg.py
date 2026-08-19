@@ -96,54 +96,51 @@ LIFT_XY_TOLERANCE = 0.08  # m, unchanged from v7 -- proven fix for the backward-
 # cheat (see leg_lift_selected_height/leg_lift_foot_horizontal docstrings)
 LIFT_BASE_HEIGHT_TARGET = 0.53  # m, unchanged from v7 -- rough's own standing target
 
-# -- v8 joint-fold anchor targets (new) --
-# "Оба сустава до уровня корпуса" (owner's spec) -- fold thigh+calf so the foot
-# tucks up near the hip, decoupled from pure world-Z clearance the same way
-# rear_stand_rear_leg_extension decoupled knee angle from root height (see that
-# function's own docstring for the precedent).
+# -- v8 joint-fold anchor target (new) --
+# "Оба сустава до уровня корпуса" (owner's spec) was the ORIGINAL intent --
+# fold thigh+calf so the foot tucks up near the hip -- but this retired the
+# thigh half after live measurement proved it geometrically incompatible
+# with leg_lift_selected_height's own economy. Full history kept here rather
+# than deleted (same "keep the failed attempt's reasoning, not just the
+# survivor" discipline this file's own weight-history comments already use
+# elsewhere):
 #
-# Derived via the SAME forward-kinematics discipline STAND_HEIGHT_TARGET/
-# REAR_LEG_EXTENSION_TARGET both used (not copied from an untested guess): b2 URDF,
-# FL_thigh_joint rotates about local +Y, and its child (the calf's own origin) sits
-# at local (0, 0, -0.35) in the thigh's own frame at thigh_joint=0. Under a +Y
-# rotation by q1, that point moves to (-0.35*sin(q1), *, -0.35*cos(q1)) in the
-# thigh-origin frame -- at the default standing value (q1=0.8) this is
-# (-0.25, *, -0.24), i.e. hanging down-and-back, consistent with a normal standing
-# leg. Increasing q1 well past 0.8 rotates the same point up-and-back; at q1~pi/2
-# the thigh is roughly horizontal, and further increase starts lifting the knee
-# ABOVE the hip. thigh_joint's own URDF range is [-0.94, 4.69] -- unusually wide,
-# clearly built to allow exactly this fold-up range (nowhere near it for a normal
-# gait). Picked THIGH_FOLD_TARGET=2.4 rad (~137 deg) as a first-guess mid-fold: past
-# horizontal, meaningfully "up", well short of the 4.69 singularity (same
-# leave-headroom discipline as every other target constant here).
+# v8.0/v8.1: picked THIGH_FOLD_TARGET via a single-link FK sketch (thigh
+# joint only, ignoring the hip's own 0.072m lateral offset baked into the
+# URDF) -- 2.4 rad, then "fixed" to 3.0 after claude-tg-base's review caught
+# the missing lateral term. Both were WRONG in a more basic way: a proper
+# MuJoCo forward-kinematics sweep (not hand analysis) across the thigh
+# joint's full usable range [0.8, 3.5] shows xy-distance-to-hip and
+# vertical clearance move TOGETHER as thigh increases -- clearance only
+# stays inside the height economy's reachable band (~0.05-0.30m,
+# LIFT_HEIGHT_MIN..LIFT_HEIGHT_MAX) at thigh~1.4-1.6, where xy is at its
+# WORST (~0.37m); xy only gets small (~0.12-0.15m) at thigh~3.0-3.3, where
+# clearance has overshot to ~0.55-0.57m -- roughly DOUBLE LIFT_HEIGHT_MAX.
+# There is no thigh angle in this URDF's geometry where both
+# leg_lift_selected_height's proximity gate AND its height target are
+# satisfiable at once. Forcing either number only ever won one gate at the
+# other's total expense -- confirmed in BOTH live runs (v8.0 it1603,
+# v8.1 it~1000: leg_lift_selected_height pinned near 0/6.0,
+# Metrics/base_velocity/height_target crashed to its curriculum floor,
+# leg_lift_joint_fold plateaued around 30% of max instead of converging).
+#
+# v8.2: thigh dropped from this anchor entirely -- see leg_lift_joint_fold's
+# own docstring for why calf-only is now the followed precedent
+# (rear_stand_rear_leg_extension already did this for an UNVERIFIED risk;
+# here the risk was verified real). THIGH_FOLD_TARGET itself is retired
+# (kept commented for the historical record, not deleted) rather than
+# reused for anything else.
+# THIGH_FOLD_TARGET = 3.0  # rad -- RETIRED v8.2, see comment block above
 #
 # calf_joint range is [-2.82, -0.43] (default -1.5); more-negative = knee bent
 # tighter (shank folded back toward the thigh). CALF_FOLD_TARGET=-2.5 folds the
-# shank most of the way toward its own limit, leaving ~0.32 rad margin from -2.82 --
-# needed so the whole assembly (thigh rotated up + calf folded back) stays compact
-# enough for the foot to actually end up NEAR the hip rather than swung out at the
-# end of a still-mostly-extended shank.
-#
-# Unlike rear_stand_rear_leg_extension (which stayed calf-only because thigh's sign
-# wasn't independently verified), BOTH joints are anchored here -- the FK derivation
-# above was carried out explicitly for this file rather than inherited unverified.
-#
-# v8.1 FIX (2026-08-19, claude-tg-base's independent review, caught while the
-# first v8 run was live): at THIGH_FOLD_TARGET=2.4, the knee's horizontal
-# offset from the hip is 0.35*sin(2.4)=0.236m -- WAY outside
-# leg_lift_selected_height's own xy_tolerance=0.08 proximity gate. Confirmed
-# in the running TensorBoard log at it1603/20000: leg_lift_selected_height
-# stuck at 0.02-0.05/6.0 while leg_lift_joint_fold climbed steadily
-# (1.28-1.38/4.0) -- the policy was learning to satisfy the fold anchor in a
-# pose the height term's own gate structurally can't reward, exactly the
-# "two co-objectives fighting" risk flagged (and missed) when this constant
-# was first picked. 2.4 -> 3.0 rad: 0.35*sin(3.0)=0.049m, back inside the
-# existing 0.08 tolerance without loosening the gate itself (the gate was
-# proven correct by v7's own backward-sweep fix -- see
-# leg_lift_selected_height's own docstring -- so tightening the FOLD target
-# to fit the PROVEN gate is lower-risk than loosening a gate that already
-# has a track record).
-THIGH_FOLD_TARGET = 3.0  # rad
+# shank most of the way toward its own limit, leaving ~0.32 rad margin from
+# -2.82. Verified (v8.2, live MuJoCo measurement): calf_joint does NOT move
+# the calf BODY's own world position at all (it rotates the SHIN around that
+# body's own origin, which only hip+thigh determine) -- so this constant is
+# STRUCTURALLY UNABLE to conflict with leg_lift_selected_height's own
+# kernel the way THIGH_FOLD_TARGET did, at any value, by construction. Kept
+# unchanged from v8.0/v8.1 -- never the source of the conflict.
 CALF_FOLD_TARGET = -2.5  # rad
 
 # Direction mapping v8 (owner's spec, see module docstring) -- forward=FR, right=RR,
@@ -489,27 +486,47 @@ def leg_lift_feet_air_time(env, command_name: str, sensor_cfg: SceneEntityCfg, t
 
 
 def leg_lift_joint_fold(env, command_name: str, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-    """v8 NEW. Secondary joint-angle anchor: exp-tracking of the SELECTED leg's
-    thigh+calf toward (THIGH_FOLD_TARGET, CALF_FOLD_TARGET) -- "foot folded up near
-    the body", decoupled from the pure world-Z clearance leg_lift_selected_height
-    already owns, same "two co-objectives, not one proxy for the other" structure as
-    rear_stand_rear_leg_extension alongside rear_stand_front_feet_height. Ramped by
-    the same signal (default pose at idle, fold target once fully commanded), masked
-    to the selected leg only via the same per-env mask as every other function here
-    -- the three support legs' own thigh/calf stay governed by leg_lift_support_pose
-    instead, so there is no double-anchoring."""
+    """v8.2 (2026-08-19, CALF-ONLY -- see the module's own THIGH_FOLD_TARGET
+    comment for the full FK measurement this retreat is based on). Secondary
+    joint-angle anchor: exp-tracking of the SELECTED leg's calf toward
+    CALF_FOLD_TARGET, decoupled from the pure world-Z clearance
+    leg_lift_selected_height already owns. Ramped by the same signal (default
+    pose at idle, fold target once fully commanded), masked to the selected
+    leg only via the same per-env mask as every other function here -- the
+    three support legs' own thigh/calf stay governed by leg_lift_support_pose
+    instead, so there is no double-anchoring.
+
+    v8.0/v8.1 anchored THIGH too, toward THIGH_FOLD_TARGET (2.4, then 3.0
+    after the first proximity-gate fix) -- both LIVE-measured (MuJoCo FK, not
+    hand analysis this time) to conflict with leg_lift_selected_height at
+    EVERY thigh angle tried: the horizontal xy-distance-to-hip
+    (leg_lift_selected_height's own proximity gate) and the vertical
+    clearance (its height target) move together as thigh increases across
+    the URDF's whole usable range -- xy only gets small (<=~0.15m) once
+    clearance has ALREADY overshot to ~0.55-0.57m, roughly double
+    LIFT_HEIGHT_MAX (0.30). There is no thigh angle where both gates are
+    simultaneously satisfiable with the CURRENT height/proximity economy;
+    forcing one number (2.4, then 3.0) only ever satisfied one gate at the
+    other's expense, which is exactly the stuck-at-~0 selected_height
+    symptom seen at both it1603/20000 (v8.0) and it1000/20000 (v8.1, this
+    time with `Metrics/base_velocity/height_target` also crashed to its
+    curriculum floor). Retreating to calf-only follows the SAME precedent
+    rear_stand_rear_leg_extension already set in rear_stand_env_cfg.py for
+    the identical reason (thigh's geometric consequence not independently
+    verified/safe -- there by omission, here by hard measurement): calf_joint
+    does not move the calf BODY's own position at all (verified: sweeping
+    calf across its full range at a fixed thigh left xy/clearance
+    unchanged to 4 decimal places -- FOOT_BODY_NAMES tracks the calf body
+    origin, which calf_joint rotates the SHIN around, not through), so this
+    term is now STRUCTURALLY INCAPABLE of conflicting with
+    leg_lift_selected_height's own kernel, at any weight, by construction."""
     term = env.command_manager.get_term(command_name)
     asset = env.scene["robot"]
     joint_pos = asset.data.joint_pos[:, asset_cfg.joint_ids].view(-1, 4, 3)  # [N,leg,joint]
     default = asset.data.default_joint_pos[:, asset_cfg.joint_ids].view(-1, 4, 3)
-    fold_target = default.clone()
-    fold_target[:, :, _THIGH_IDX] = THIGH_FOLD_TARGET
-    fold_target[:, :, _CALF_IDX] = CALF_FOLD_TARGET
     signal = term.signal.view(-1, 1, 1)
-    target = default + (fold_target - default) * signal
-    err = torch.sum(
-        torch.square(joint_pos[:, :, _THIGH_IDX:_CALF_IDX + 1] - target[:, :, _THIGH_IDX:_CALF_IDX + 1]), dim=2
-    )  # [N,4]
+    calf_target = default[:, :, _CALF_IDX] + (CALF_FOLD_TARGET - default[:, :, _CALF_IDX]) * signal.squeeze(-1)
+    err = torch.square(joint_pos[:, :, _CALF_IDX] - calf_target)  # [N,4]
     kernel = torch.exp(-err / TRACKING_SIGMA)
     mask = _selected_leg_mask(env, command_name)
     return (kernel * mask).sum(dim=1)
