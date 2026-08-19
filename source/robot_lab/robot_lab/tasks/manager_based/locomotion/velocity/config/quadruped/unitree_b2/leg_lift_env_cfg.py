@@ -615,9 +615,34 @@ class UnitreeB2LegLiftRoughEnvCfg(UnitreeB2RoughEnvCfg):
             weight=-8.0,
             params={"command_name": "base_velocity", "target_height": LIFT_BASE_HEIGHT_TARGET},
         )
+        # v8.3 FIX (2026-08-19, owner's live bench verdict on the it2000
+        # checkpoint: "сидит на задних коленях... боком, корпус наклонен").
+        # Confirmed via direct 50Hz MuJoCo telemetry (not just the 10fps
+        # mosaic): RR/RL calf-body world-Z pinned near ~0.03m (a normal
+        # standing value is ~0.34m -- see leg_lift_selected_height's own
+        # clearance formula) while FL/FR stayed elevated -- the policy was
+        # CROUCHING THE THREE SUPPORT LEGS instead of lifting the commanded
+        # one: leg_lift_selected_height's clearance is `selected_z -
+        # mean(other_3_z)`, so lowering the other three has the EXACT SAME
+        # numeric effect as raising the selected foot, and is evidently
+        # cheaper once v8 added new positive terms on top (com_over_support
+        # +5, feet_on_air +3, feet_air_time +3) that grew the total reward
+        # available from an active lift without anything ALSO growing the
+        # cost of this specific free variable. -4.0 was not dominant enough
+        # against that larger pot. -10.0: same class of value as
+        # leg_lift_selected_height's own +6.0 dominant weight (support pose
+        # must cost at least as much as the height trade it would otherwise
+        # fund), matching this file's own established "match the weight the
+        # exploit is funded by" pattern (e.g. leg_lift_base_height's -8.0
+        # matched jump_idle_height's own squat-anchor scale). If this alone
+        # doesn't hold (this file's own history has repeatedly needed more
+        # than a single weight bump for this exact "free variable" class of
+        # bug), the more robust next step is an ABSOLUTE per-leg floor on
+        # each support foot's own world-Z (not relative to anything the
+        # policy can also move), not another weight increment.
         self.rewards.leg_lift_support_pose = RewTerm(
             func=leg_lift_support_pose,
-            weight=-4.0,
+            weight=-10.0,
             params={
                 "command_name": "base_velocity",
                 "asset_cfg": SceneEntityCfg("robot", joint_names=LEG_JOINT_NAMES_ORDERED, preserve_order=True),
