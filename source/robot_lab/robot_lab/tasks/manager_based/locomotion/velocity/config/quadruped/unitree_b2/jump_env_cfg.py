@@ -71,6 +71,58 @@ class JumpPulseCommand(CommandTerm):
         self.phase = torch.zeros(n, device=self.device)
         self._directions = torch.tensor(cfg.directions, dtype=torch.float, device=self.device)
 
+        # v7 (2026-08-19, gate-fix -- claude-tg-base's diagnosis of the v6 failure,
+        # verified against the code myself: the OLD `landing_active = elapsed >=
+        # window_end` below was a pure TIMER, with no check that a real liftoff
+        # ever happened. All four v6 positive landing-package terms (combined
+        # weight 22) are gated on landing_active alone -- so they paid in full for
+        # simply STANDING through the window and into the settle slice, no jump
+        # required. A jump only ever RISKS that free payout (movement away from
+        # the already-rewarded default stance costs elsewhere too), so the
+        # dominant, cheapest strategy the policy actually found was standing
+        # still and collecting the landing package uncontested -- exactly the
+        # "щенячий прыжок, полу-ползание" the owner's live bench saw.
+        #
+        # Fix: `had_flight` is a per-env boolean LATCH, armed the first time all
+        # four feet are simultaneously off the ground (same _feet_airborne
+        # definition every other flight-gated term in this file already uses)
+        # AND the base has genuinely cleared MIN_FLIGHT_BASE_HEIGHT (0.55 --
+        # reusing the exact anti-squat-pogo constant jump_flight/
+        # jump_flight_distance already gate on, not a new number) -- the extra
+        # height check exists so a contact-sensor blip/stumble that clears the
+        # ground for one physics step without real height can't arm the latch on
+        # its own. Reset every cycle in _resample_command. landing_active now
+        # ANDs this in: a cycle that never produced a real flight pays NOTHING
+        # from the positive landing package, full stop.
+        self.had_flight = torch.zeros(n, dtype=torch.bool, device=self.device)
+        # Rising-edge flag for landing_active (this step is the FIRST step of the
+        # landing slice for envs that actually flew) -- drives the new v7
+        # episodic-style bonuses below, which must pay ONCE per successful jump
+        # attempt, not every step of the whole landing slice (Atanassov's own
+        # task_max_height/jumping pay once per episode at touchdown; our episode
+        # holds many jump CYCLES, so this fires once per CYCLE instead -- see
+        # jump_task_max_height's own docstring for the full adaptation note).
+        self._prev_landing_active = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.landing_edge = torch.zeros(n, dtype=torch.bool, device=self.device)
+        # Peak world-Z reached so far THIS CYCLE -- the episodic max_height
+        # analog. Reset to the current (near-standing, since a fresh cycle always
+        # starts in idle) height at each resample, same "reset to standing
+        # baseline" idiom Atanassov's own self.max_height[env_ids] =
+        # self.base_init_state[2] uses.
+        self.cycle_peak_height = torch.zeros(n, device=self.device)
+        # Cached contact-sensor resolution for the gate-fix's own airborne check
+        # AND jump_change_of_contact below -- resolved once here via the same
+        # SceneEntityCfg mechanism the reward manager itself uses (not the
+        # module's free _feet_airborne helper, which expects a pre-resolved
+        # sensor_cfg param a command term doesn't otherwise receive), same
+        # pattern leg_lift_env_cfg.py's own v8 curriculum uses for command-term-
+        # internal body/sensor lookups.
+        self._feet_sensor_cfg = SceneEntityCfg("contact_forces", body_names=".*_calf")
+        self._feet_sensor_cfg.resolve(self._env.scene)
+        self._prev_contacts = torch.zeros(n, 4, dtype=torch.bool, device=self.device)
+        self.contacts = torch.zeros(n, 4, dtype=torch.bool, device=self.device)
+        self.contact_diff = torch.zeros(n, device=self.device)
+
     @property
     def command(self) -> torch.Tensor:
         return self._command
@@ -90,12 +142,56 @@ class JumpPulseCommand(CommandTerm):
         dir_idx = torch.randint(0, self._directions.shape[0], (len(env_ids),), device=self.device)
         self.direction[env_ids] = self._directions[dir_idx]
 
+        # v7 gate-fix state, reset for the fresh cycle these env_ids are starting.
+        self.had_flight[env_ids] = False
+        self._prev_landing_active[env_ids] = False
+        self.landing_edge[env_ids] = False
+        # v7 fix (2026-08-19, claude-tg-base's review, caught before launch):
+        # clamped to STANDING_TARGET_HEIGHT, not the raw live root z. This
+        # _resample_command call also fires on a fresh EPISODE reset (see
+        # JumpPulseCommand's own class docstring / IsaacLab's own
+        # CommandTerm.reset()->_resample() chain), and rough_env_cfg.py's
+        # randomize_reset_base event spawns the robot at z up to +0.2m above
+        # nominal AND at a fully random roll/pitch (+-pi) -- an uncapped read
+        # here could seed cycle_peak_height near JUMP_TASK_MAX_HEIGHT_TARGET
+        # (0.85) from spawn randomization alone, before the robot has taken a
+        # single step, handing jump_task_max_height (weight 25) a large free
+        # payout for doing nothing. Clamping the INITIAL value to the standing
+        # target means every bit of credit toward the target must come from
+        # genuine upward progress made DURING the cycle.
+        self.cycle_peak_height[env_ids] = torch.clamp(
+            self.robot.data.root_pos_w[env_ids, 2], max=STANDING_TARGET_HEIGHT
+        )
+
     def _update_command(self):
         elapsed = self.cycle_duration - self.time_left
         window_start = self.idle_duration
         window_end = self.idle_duration + self.cfg.window_duration
         self.window_active = (elapsed >= window_start) & (elapsed < window_end)
-        self.landing_active = elapsed >= window_end
+
+        # v7 gate-fix: arm had_flight the first time all four feet are genuinely
+        # airborne (contact-sensor fact, not a visual guess) AND the base has
+        # cleared MIN_FLIGHT_BASE_HEIGHT -- see this attribute's own __init__
+        # comment for the full diagnosis this fixes.
+        contact_sensor = self._env.scene.sensors[self._feet_sensor_cfg.name]
+        in_contact = contact_sensor.data.current_contact_time[:, self._feet_sensor_cfg.body_ids] > 0.0
+        self.contacts = in_contact
+        # v7: per-step contact-state churn, for jump_change_of_contact below --
+        # Atanassov's own change_of_contact, computed once here (not inside the
+        # reward function) since it needs the PREVIOUS step's contact state,
+        # which only the command term persists across steps.
+        self.contact_diff = torch.sum(torch.abs(self.contacts.float() - self._prev_contacts.float()), dim=1)
+        self._prev_contacts = self.contacts.clone()
+        all_airborne = ~in_contact.any(dim=1)
+        base_z = self.robot.data.root_pos_w[:, 2]
+        self.had_flight = self.had_flight | (self.window_active & all_airborne & (base_z > MIN_FLIGHT_BASE_HEIGHT))
+        self.cycle_peak_height = torch.max(self.cycle_peak_height, base_z)
+
+        landing_timer = elapsed >= window_end
+        self.landing_active = landing_timer & self.had_flight
+        self.landing_edge = self.landing_active & ~self._prev_landing_active
+        self._prev_landing_active = self.landing_active.clone()
+
         self.phase = torch.where(
             self.window_active,
             ((elapsed - window_start) / self.cfg.window_duration).clamp(0.0, 1.0),
@@ -186,6 +282,51 @@ LAUNCH_PHASE_END = 0.60
 JUMP_LANDING_POSE_SIGMA = 0.1
 JUMP_LANDING_HEIGHT_SIGMA = 0.02
 JUMP_LANDING_STILL_SIGMA = 0.5
+
+# Named 2026-08-19 (v7 gate-fix) -- was already a bare 0.55 literal passed to
+# jump_flight/jump_flight_distance's own min_base_height param below (their
+# anti-squat-pogo gate, 2026-08-05). Named now because JumpPulseCommand's own
+# had_flight latch (see its __init__ comment) reuses the EXACT same value for
+# the exact same purpose ("did a real jump happen, not just ground noise") --
+# a shared named constant keeps the two uses from silently drifting apart if
+# either is ever retuned.
+MIN_FLIGHT_BASE_HEIGHT = 0.55
+
+# Named 2026-08-19 (v7, cycle_peak_height's own init-clamp fix) -- was already
+# a bare 0.53 literal at jump_landing_height_stance/jump_idle_height's own
+# target_height params below (rough's own standing target). Named here
+# because the clamp fix needs the exact same number for the exact same
+# reason ("this is what a legitimate standing pose's height is"); the two
+# pre-existing literal call sites are left as-is (unrelated to this fix,
+# not touched to keep the diff scoped).
+STANDING_TARGET_HEIGHT = 0.53
+
+# v7 (2026-08-19, Atanassov-style episodic bonuses, see jump_task_max_height/
+# jump_task_jumping_bonus's own docstrings). Absolute world-Z peak-height
+# target -- NOT copied from Atanassov's own 0.9m (their Go1 stands at 0.32m,
+# so 0.9m is ~0.58m of clearance, ~1.8x their own standing height; scaling
+# that SAME ratio to B2's 74.5kg/0.53m stance would demand ~0.95m of
+# clearance, physically implausible for a robot this heavy -- torque/mass
+# doesn't scale the way a small-robot ratio would suggest). Derived instead
+# from B2's own leg geometry, same FK discipline as leg_lift_env_cfg.py's own
+# THIGH_FOLD_TARGET reasoning: b2 URDF thigh-to-calf link is 0.35m, so a
+# fully explosive extension could plausibly clear somewhere near one
+# thigh-length above stance in a genuine dynamic launch (more than the
+# 0.30m leg_lift v8 used for a STATIC fold, since a jump adds real upward
+# velocity on top of pure geometry) -- 0.53 (jump_landing_height_stance's own
+# standing target) + 0.35 = 0.88, rounded to 0.85 to leave the same kind of
+# headroom-from-an-unverified-ceiling margin every other first-guess target
+# in this codebase leaves. FIRST GUESS, not vendor-sourced (Unitree's own B2
+# marketing gives only a >1.6m horizontal LENGTH figure, no vertical number --
+# see TRAIN_RESEARCH.md's [WEB] entry) -- expect postmortem-driven revision.
+JUMP_TASK_MAX_HEIGHT_TARGET = 0.85
+JUMP_TASK_MAX_HEIGHT_SIGMA = 0.08  # rad^2-equivalent scale; loose enough that
+# partial progress toward the target still earns a visible gradient (this
+# codebase's own TRACKING_SIGMA-family constants run 0.02-0.25 for comparably
+# scaled position/height errors; 0.08 sits in that band, deliberately softer
+# than JUMP_LANDING_HEIGHT_SIGMA=0.02 since THIS term must stay informative
+# across a much wider possible range of peak heights, not just discriminate
+# a near-perfect landing stance).
 
 
 def _feet_airborne(env, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
@@ -735,6 +876,75 @@ def jump_landing_still_bonus(env, command_name: str) -> torch.Tensor:
     return torch.exp(-(ang + lin) / JUMP_LANDING_STILL_SIGMA) * term.landing_active.float()
 
 
+# v7 (2026-08-19): Atanassov et al.'s episodic (paid-once-at-touchdown) reward
+# style, ported from their own legged_gym source (github.com/vassil-atn/
+# Curriculum-Quadruped-Jumping-DRL, legged_robot.py::_reward_task_max_height/
+# _reward_jumping -- checked directly, not from a paraphrase, see
+# TRAIN_RESEARCH.md). Structural adaptation, documented up front: their
+# episode ends at (or shortly after) the one jump it contains, so "once per
+# episode" and "once at touchdown" are the same event; OUR episode holds MANY
+# jump cycles back to back (idle->window->landing->resample, repeated for the
+# whole episode length), so these fire once per CYCLE instead, on
+# `term.landing_edge` (the first step landing_active turns true for a cycle
+# that actually had a flight -- see JumpPulseCommand.__init__'s own comment).
+# Weights are NOT copied from their 5000/200 -- see the registration site
+# below for why those numbers don't transfer to this file's own scale.
+def jump_task_max_height(env, command_name: str) -> torch.Tensor:
+    """Positive, paid ONCE per cycle at the landing_edge: exp-tracking of this
+    cycle's peak world-Z (term.cycle_peak_height) toward
+    JUMP_TASK_MAX_HEIGHT_TARGET. Direct port of Atanassov's own
+    `_reward_task_max_height` (`exp(-(max_height-0.9)**2 / sigma)`, gated to
+    `has_jumped` envs at episode end) -- same shape, per-cycle instead of
+    per-episode, target rederived for B2 (see JUMP_TASK_MAX_HEIGHT_TARGET's
+    own comment). Naturally zero for a cycle that never had a real flight:
+    landing_edge itself can only ever be True once had_flight has latched
+    (landing_active = landing_timer & had_flight), so no separate had_flight
+    check is needed here -- the v6 failure mode (paid for standing still) is
+    structurally impossible for an edge-triggered term."""
+    term = env.command_manager.get_term(command_name)
+    err = torch.square(term.cycle_peak_height - JUMP_TASK_MAX_HEIGHT_TARGET)
+    return torch.exp(-err / JUMP_TASK_MAX_HEIGHT_SIGMA) * term.landing_edge.float()
+
+
+def jump_task_jumping_bonus(env, command_name: str, height_threshold: float) -> torch.Tensor:
+    """Positive, paid ONCE per cycle at landing_edge: flat bonus if this
+    cycle's peak height cleared `height_threshold`. Direct port of
+    Atanassov's own `_reward_jumping` (binary, `max_height>0.50` at episode
+    end) -- coarse complement to jump_task_max_height's own sharp exp-kernel,
+    same "cheap bootstrap alongside a precise shaping term" relationship
+    jump_flight(8)/jump_flight_distance(8) already have in this file.
+    height_threshold reuses MIN_FLIGHT_BASE_HEIGHT (the same "did a real jump
+    happen" bar the gate-fix itself uses) rather than a new number."""
+    term = env.command_manager.get_term(command_name)
+    return (term.cycle_peak_height > height_threshold).float() * term.landing_edge.float()
+
+
+def jump_change_of_contact(env, command_name: str) -> torch.Tensor:
+    """Continuous, every step: rewards the four feet's contact STATE staying
+    UNCHANGED between consecutive steps (term.contact_diff, computed inside
+    JumpPulseCommand._update_command since it needs the previous step's
+    contacts). Direct port of Atanassov's own `_reward_change_of_contact`
+    (`exp(-diff**2/4)`) -- HIGH when contact is stable (diff=0), LOW when it's
+    churning, same as here.
+    v7 CORRECTION (2026-08-19, claude-tg-base's independent review caught
+    this before launch): this function was always right, but the
+    REGISTRATION below originally applied a NEGATIVE weight on the mistaken
+    belief that Atanassov register theirs as a penalty -- checked their
+    go1_config.py again: `change_of_contact = 10.0`, POSITIVE. A negative
+    weight on an exp-kernel that's HIGH at zero churn does not "penalize
+    churn" -- it penalizes STABILITY and rewards churn (idle standing still,
+    diff=0 nearly every step, would have paid -3.0/step; a foot chattering
+    wildly would pay near 0, i.e. relatively BETTER). Fixed to a positive
+    weight, matching Atanassov's own sign. Not phase-gated -- active through
+    idle/crouch/launch/flight/landing alike, matching their own always-on
+    term (their 0.5x post-landing scale-down is NOT ported: "has_jumped" in
+    their code means "anywhere past this episode's one jump", which doesn't
+    map onto our repeating-cycle structure without extra state; flagged here
+    as a known simplification, not an oversight)."""
+    term = env.command_manager.get_term(command_name)
+    return torch.exp(-torch.square(term.contact_diff) / 4.0)
+
+
 @configclass
 class UnitreeB2JumpRoughEnvCfg(UnitreeB2RoughEnvCfg):
     """See module docstring -- discrete triggered jump, not a locomotion gait."""
@@ -792,7 +1002,7 @@ class UnitreeB2JumpRoughEnvCfg(UnitreeB2RoughEnvCfg):
                 # 0.6 -> 0.55 (2026-08-05): gentler first rung -- just above the
                 # 0.53 standing height still means a genuine jump, reachable at
                 # v_z ~2.6 from the crouch instead of ~2.8.
-                "min_base_height": 0.55,
+                "min_base_height": MIN_FLIGHT_BASE_HEIGHT,
             },
         )
         self.rewards.jump_flight_distance = RewTerm(
@@ -805,7 +1015,7 @@ class UnitreeB2JumpRoughEnvCfg(UnitreeB2RoughEnvCfg):
                 # of it -- 2.0 m/s of credited airborne velocity is plenty for that
                 # and caps the incentive to launch ballistically.
                 "max_vel": 2.0,
-                "min_base_height": 0.55,
+                "min_base_height": MIN_FLIGHT_BASE_HEIGHT,
             },
         )
         self.rewards.jump_landing_settle = RewTerm(
@@ -1011,6 +1221,84 @@ class UnitreeB2JumpRoughEnvCfg(UnitreeB2RoughEnvCfg):
             params={"command_name": "base_velocity"},
         )
 
+        # v7 (2026-08-19): Atanassov-style episodic bonuses (see the three
+        # functions' own docstrings). Weights independently recalibrated for
+        # THIS file's own scale, NOT copied from Atanassov's 5000/200/10 --
+        # their numbers are meaningful within their own reward SUM (which they
+        # additionally post-process via only_positive_rewards_ji22_style, a
+        # global positive/negative split this codebase's manager-based
+        # RewardManager has no hook for -- see TRAIN_RESEARCH.md for why that
+        # piece was deliberately NOT ported rather than faked). Everything
+        # else in this file lives in the 0.5-10 range; a literal 5000 would
+        # swamp every other term into irrelevance. jump_task_max_height set
+        # ABOVE the existing landing package (22 combined) and the launch
+        # anchor (vertical_launch 10) -- it is meant to be the single largest
+        # incentive in the file, matching Atanassov's own relative emphasis
+        # ("их главная тяга") without adopting their absolute scale.
+        self.rewards.jump_task_max_height = RewTerm(
+            func=jump_task_max_height,
+            weight=25.0,
+            params={"command_name": "base_velocity"},
+        )
+        self.rewards.jump_task_jumping_bonus = RewTerm(
+            func=jump_task_jumping_bonus,
+            weight=6.0,
+            params={"command_name": "base_velocity", "height_threshold": MIN_FLIGHT_BASE_HEIGHT},
+        )
+        # v7 fix (2026-08-19, claude-tg-base's review): was -3.0 -- see the
+        # function's own docstring for the sign-inversion this caused (idle
+        # stability penalized, contact chatter effectively rewarded). Positive,
+        # matching Atanassov's own go1_config.py `change_of_contact = 10.0`.
+        self.rewards.jump_change_of_contact = RewTerm(
+            func=jump_change_of_contact,
+            weight=3.0,
+            params={"command_name": "base_velocity"},
+        )
+
         # If the weight of rewards is 0, set rewards to None
         if self.__class__.__name__ == "UnitreeB2JumpRoughEnvCfg":
+            self.disable_zero_weight_rewards()
+
+
+# v7 Stage 1 (2026-08-19, Atanassov two-stage curriculum, "ignition через
+# vertical проще" -- their own go1_upwards_config.py vs go1_config.py diff,
+# checked directly): pure vertical jump-in-place, no horizontal command at
+# all. Reuses UnitreeB2JumpRoughEnvCfg's entire command/phase/reward
+# machinery unmodified except the sampled direction set -- with
+# directions=((0.0,0.0),), jump_flight_distance/jump_direction_velocity fully
+# zero (each multiplies by a body-frame `direction` dot product that is now
+# always (0,0)), so there is nothing to separately retire for those two.
+# CORRECTION (claude-tg-base's review): jump_direction_precision only PARTLY
+# zeroes -- its v_perp term depends on `direction` the same way and goes to
+# zero, but its `w_z` (yaw-rate) term is added unconditionally, independent
+# of direction (see the function's own body) -- it stays live and still
+# penalizes body twist during a vertical launch, which is exactly what a
+# pure-vertical jump should want anyway (no reason to spin). Verified via the
+# stage-1 smoke test: jump_flight_distance/jump_direction_velocity read
+# 0.0000 every iteration; jump_direction_precision does too here only
+# because the random early policy barely yaws yet, not because the term is
+# structurally zero.
+#
+# Deliberately NOT a full port of their own stage-1 config: their version
+# also shortens episode_length_s (4->3), reduces "gentleness" weights across
+# the board (task_pos 1500->200 etc. -- inapplicable here anyway, this file
+# has no task_pos/ori since it never had a landing-POSITION command to begin
+# with), adds has_jumped_random_prob-style episode-init domain randomization,
+# and toggles continuous_jumping off (reset after every single jump). That
+# last piece in particular does not map cleanly onto this file's own
+# "one long episode, many jump cycles" structure without a new termination
+# term -- scoped out for this round (documented simplification, not an
+# oversight); flagged as a candidate follow-up if Stage 1 alone doesn't
+# ignite.
+@configclass
+class UnitreeB2JumpUpwardRoughEnvCfg(UnitreeB2JumpRoughEnvCfg):
+    """Stage 1 of the v7 two-stage curriculum: vertical-only jump-in-place,
+    meant to be trained first and short (ignition), with Stage 2 (forward,
+    full weights) resuming from whatever checkpoint this produces."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.commands.base_velocity.directions = ((0.0, 0.0),)
+
+        if self.__class__.__name__ == "UnitreeB2JumpUpwardRoughEnvCfg":
             self.disable_zero_weight_rewards()
