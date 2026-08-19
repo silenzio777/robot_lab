@@ -95,6 +95,9 @@ LIFT_XY_GATE_SIGMA = 0.004  # m^2, ~2.5x sharper than TRACKING_SIGMA (see
 LIFT_XY_TOLERANCE = 0.08  # m, unchanged from v7 -- proven fix for the backward-sweep
 # cheat (see leg_lift_selected_height/leg_lift_foot_horizontal docstrings)
 LIFT_BASE_HEIGHT_TARGET = 0.53  # m, unchanged from v7 -- rough's own standing target
+# v8.5 (2026-08-19) -- see leg_lift_foot_height_floor's own docstring for the
+# full "why an absolute floor, not another relative weight bump" reasoning.
+FOOT_HEIGHT_FLOOR = 0.20  # m
 
 # -- v8 joint-fold anchor target (new) --
 # "Оба сустава до уровня корпуса" (owner's spec) was the ORIGINAL intent --
@@ -426,6 +429,31 @@ def leg_lift_base_still(env, command_name: str) -> torch.Tensor:
     return v_xy + w_z
 
 
+def leg_lift_foot_height_floor(env, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """v8.5 FIX (2026-08-19, owner's live bench verdict on v8.4 it1700: stopped
+    falling, but STILL "сидит на корточках" -- confirmed via telemetry, root
+    pitch -15.4 deg, rear thigh/calf 0.3-0.55 rad off default, essentially
+    unchanged from v8.3/v8.4's own failures despite TWO consecutive weight
+    increases on leg_lift_support_pose/flat_orientation_l2 (-4->-10, -5->-10).
+    That relative/joint-angle-MSE lever evidently isn't winning fast enough --
+    this is a DIFFERENT kind of anchor: an ABSOLUTE, always-on floor on each
+    of the FOUR feet's own world-Z (not joint angles, not relative to any
+    other measured quantity a policy could also move -- the exact "no free
+    variable" discipline leg_lift_support_pose's own v8.3 comment already
+    flagged as the next step if a second weight bump didn't hold). 0.20m is
+    well below a genuine standing clearance (~0.336m, see THIGH_FOLD_TARGET's
+    own FK derivation) but well above the collapsed rear-leg reading actually
+    observed (~0.03m) -- a hard "don't let a foot sink this low" floor, not a
+    height target. Applies to ALL FOUR feet unconditionally (no signal gate,
+    no selected-leg exemption): during an active lift the selected foot only
+    ever moves UP from here, never down, so this can't fight a real lift --
+    it only ever fires on a genuine collapse."""
+    asset = env.scene["robot"]
+    foot_z = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]
+    deficit = (FOOT_HEIGHT_FLOOR - foot_z).clamp(min=0.0)
+    return torch.sum(torch.square(deficit), dim=1)
+
+
 def leg_lift_support_pose(env, command_name: str, asset_cfg: SceneEntityCfg) -> torch.Tensor:
     """L1 penalty on joint deviation from default, masked to the THREE support legs
     only, exemption scaled by the lift signal (v4-era fix, kept). Unchanged from v7
@@ -666,6 +694,17 @@ class UnitreeB2LegLiftRoughEnvCfg(UnitreeB2RoughEnvCfg):
             params={
                 "command_name": "base_velocity",
                 "asset_cfg": SceneEntityCfg("robot", joint_names=LEG_JOINT_NAMES_ORDERED, preserve_order=True),
+            },
+        )
+        # v8.5 -- see leg_lift_foot_height_floor's own docstring. -15.0: same
+        # class of dominance as support_pose's own -10.0, deliberately higher
+        # since this is the last, hardest-to-game line of defense against the
+        # collapse v8.3/v8.4 both still showed.
+        self.rewards.leg_lift_foot_height_floor = RewTerm(
+            func=leg_lift_foot_height_floor,
+            weight=-15.0,
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names=FOOT_BODY_NAMES, preserve_order=True),
             },
         )
 
