@@ -54,7 +54,19 @@ from .rough_env_cfg import UnitreeB2RoughEnvCfg
 # policy settled into a half-rear "beg" pose ~30deg short of vertical.
 STANDUP_DURATION = 2.0
 # Base height once vertical -- rear-leg stand geometry first guess, calibrate.
-STAND_HEIGHT_TARGET = 0.85
+# 0.85 -> 0.62 (v6.2, 2026-08-17, owner's own doubt confirmed by URDF geometry):
+# thigh=0.35m + calf=0.35m (b2.urdf: FL_calf_joint origin z=-0.35 off thigh,
+# FL_foot_joint origin z=-0.35 off calf) = 0.70m hip-to-foot MAXIMUM reach at a
+# fully straight knee -- a mechanical singularity, never actually reachable (zero
+# force capability, no real quadruped/biped stands locked-straight). 0.85 EXCEEDED
+# even that impossible ceiling by 15cm. Explains the v6.1 postmortem exactly:
+# height climbed genuinely (sigma fix worked) but decelerated approaching a target
+# past the robot's own kinematic limit, not "needs more time". 0.62 = ~89% of the
+# 0.70m theoretical max, leaving room for the slight functional knee bend a real
+# stand needs (a straight-locked leg can't correct for sway). First real value
+# this constant has had since its own "first guess, calibrate from what training
+# produces" comment (2026-08-06) -- now grounded in the actual mesh geometry.
+STAND_HEIGHT_TARGET = 0.62
 # 0.5 -> 0.25 (2026-08-06, same plateau): with the original broad kernel the
 # gradient near the top is flat -- at ~66% tracking the marginal reward for the
 # last 30deg didn't beat the fall risk, so the policy parked (reward flat 1100+
@@ -135,11 +147,34 @@ TURN_WZ_RANGE = (-0.4, 0.4)  # rad/s -- original used +-0.2 under a looser track
 #      committing to a stride risks the 8 to chase the 2.5. go2_stand's own
 #      contact-schedule term carries w=4 -- the dominant lever there, an
 #      afterthought here. Rebalanced below.
-CMD_STILL_PROB = 0.2  # 0.3 -> 0.2 (v5): still cycles earn their keep, but walking is the scarce skill
-CMD_WALK_PROB = 0.5  # 0.4 -> 0.5 (v5)
+# v6 "stand-only" (2026-08-16, owner's direct staging order after re-watching
+# the Go2 reference video: "Нужно делать по частям! Сначала встаем на задние" --
+# the reference dog FIRST truly stands up on its rear FEET, torso vertical,
+# lower legs half-bent, pressing the feet into the floor; ours never once even
+# attempted that in three full runs, it sits on its folded calves instead).
+# Phase 1 trains ONLY the rise -> hold-still -> descend cycle: no walking, no
+# turning -- those come back as later phases once the true stand exists.
+# 0.2 -> 1.0 / 0.5 -> 0.0: every cycle is a pure stand cycle. Command vector
+# stays 6-wide (walk/turn slots just always 0, gait clock ticks harmlessly),
+# so a phase-1 checkpoint warm-starts phase 2 (walking) without an obs change.
+CMD_STILL_PROB = 1.0
+CMD_WALK_PROB = 0.0
 CMD_TURN_PROB = 1.0 - CMD_STILL_PROB - CMD_WALK_PROB
 WALK_VX_MIN = 0.15  # v5: commands below this train nothing (see cause 3 above)
-GAIT_CYCLE_TIME = 0.5  # s -- 0.25 -> 0.5 (v5, cause 2): 2Hz stepping for a robot 5x Go2's mass
+# v5.1 (2026-08-12, user: "можно сделать частоту рулилкой на стенде?"): the
+# clock was a CONSTANT (0.5s) through v5 -- the bench could only extrapolate a
+# different frequency out-of-distribution (a slider that fakes a metronome the
+# network never trained against, no guarantee it responds sanely). Made it a
+# genuinely TRAINED control instead, same recipe as walk_vx/turn_wz: sample a
+# fresh cadence PER EPISODE from this range, tell the network the actual value
+# (new command slot 5, see RearStandCommand.reset), and let
+# rear_stand_rear_feet_contact's own existing sin-phase mask do the rest --
+# it already prices matching footfall to whatever the current sin/cos says,
+# so a faster-commanded cadence mechanically demands faster stepping without
+# any reward change. 0.35-0.8s covers roughly 1.25-2.9 Hz -- centered on v5's
+# own 0.5s (2Hz), bounded so the fastest case still asks for something a
+# 74.5kg robot can plausibly hit (see the v5 module comment, cause 2).
+GAIT_CYCLE_RANGE = (0.35, 0.8)  # s, sampled once per episode -- see command slot 5
 GAIT_BIAS = 0.2  # double-support tolerance band around each sin zero-crossing, matches go2_stand's own bias
 FEET_CLEARANCE_TARGET = 0.05  # m -- matches go2_stand's own target_foot_height; uncalibrated first guess, see rear_stand_feet_clearance's own docstring
 
@@ -157,7 +192,9 @@ class RearStandCommand(CommandTerm):
         # v4: slots 0=stand signal, 1=walk vx, 2=sin(gait phase), 3=cos(gait phase),
         # 4=turn wz. Was 3 slots through v3 -- NOT warm-start-compatible with any
         # earlier checkpoint (input layer shape changed).
-        self._command = torch.zeros(n, 5, device=self.device)
+        # v5.1: slot 5=gait_cycle_time (seconds, see GAIT_CYCLE_RANGE) -- grew
+        # 5->6, again not warm-start-compatible with v4/v5 checkpoints.
+        self._command = torch.zeros(n, 6, device=self.device)
         self.signal = torch.zeros(n, device=self.device)
         self.idle_duration = torch.zeros(n, device=self.device)
         self.hold_duration = torch.zeros(n, device=self.device)
@@ -170,6 +207,12 @@ class RearStandCommand(CommandTerm):
         # much harder learning problem than two separate skills, revisit once both
         # are individually solid.
         self.turn_wz = torch.zeros(n, device=self.device)
+        # v5.1: this episode's gait cadence -- sampled ONCE per true episode
+        # reset (see reset() below), NOT per stand-cycle like walk_vx/turn_wz.
+        # A robot's stepping tempo doesn't randomly change mid-walk in real
+        # life; it's a dial you set and it holds -- exactly how the bench's
+        # own "Gait clock (s)" slider is meant to be used.
+        self.gait_cycle_time = torch.full((n,), sum(cfg.gait_cycle_range) / 2.0, device=self.device)
 
     @property
     def command(self) -> torch.Tensor:
@@ -177,6 +220,20 @@ class RearStandCommand(CommandTerm):
 
     def _update_metrics(self):
         self.metrics["stand_signal"] = self.signal.clone()
+        self.metrics["gait_cycle_time"] = self.gait_cycle_time.clone()
+
+    def reset(self, env_ids=None):
+        # v5.1: sample this episode's cadence HERE, not in _resample_command --
+        # that function also fires mid-episode at every natural stand-cycle
+        # boundary (see this class's own docstring, "same clock trick as
+        # jump's JumpPulseCommand"), and the cadence must NOT jump around
+        # inside one episode (see gait_cycle_time's own comment in __init__).
+        # reset() is called only at true episode start (base CommandTerm's own
+        # contract), so this is the one place that fires exactly once per life.
+        ids = slice(None) if env_ids is None else env_ids
+        n = self.gait_cycle_time[ids].shape[0]
+        self.gait_cycle_time[ids] = torch.empty(n, device=self.device).uniform_(*self.cfg.gait_cycle_range)
+        return super().reset(env_ids)
 
     def _resample_command(self, env_ids):
         idle = torch.empty(len(env_ids), device=self.device).uniform_(*self.cfg.idle_time_range)
@@ -229,9 +286,19 @@ class RearStandCommand(CommandTerm):
         # own _get_phase), independent of this command's own idle/rise/hold/descend
         # cycle -- always present in the observation so the policy has a metronome
         # available even before a walk cycle starts.
-        phase = self._env.episode_length_buf.float() * self._env.step_dt / GAIT_CYCLE_TIME
+        # v5.1: divides by this EPISODE's own sampled cadence (per-env tensor) instead
+        # of a shared constant -- one consistent cadence for the robot's whole life
+        # (see gait_cycle_time's own comment), math otherwise unchanged.
+        phase = self._env.episode_length_buf.float() * self._env.step_dt / self.gait_cycle_time
         self._command[:, 2] = torch.sin(2.0 * torch.pi * phase)
         self._command[:, 3] = torch.cos(2.0 * torch.pi * phase)
+        # v5.1: the cadence VALUE itself, in seconds -- sin/cos alone can't reveal
+        # how fast the clock is ticking from a single instantaneous reading (same
+        # ambiguity as glancing at a clock face once and not knowing if the hands
+        # are fast or slow), so the network needs it as an explicit number to
+        # actually condition its stepping speed on. Raw seconds (not Hz, not
+        # normalized) to match the bench's own "Gait clock (s)" slider 1:1.
+        self._command[:, 5] = self.gait_cycle_time
 
 
 @configclass
@@ -249,6 +316,8 @@ class RearStandCommandCfg(CommandTermCfg):
     turn_wz_range: tuple[float, float] = TURN_WZ_RANGE
     cmd_still_prob: float = CMD_STILL_PROB
     cmd_walk_prob: float = CMD_WALK_PROB
+    # v5.1 addition -- see GAIT_CYCLE_RANGE's own module-level comment.
+    gait_cycle_range: tuple[float, float] = GAIT_CYCLE_RANGE
     debug_vis: bool = False
 
 
@@ -313,6 +382,42 @@ def rear_stand_orientation_tracking(env, asset_cfg=None) -> torch.Tensor:
     return torch.exp(-err / TRACKING_SIGMA)
 
 
+# v6 (2026-08-16): height gets its OWN, much sharper sigma. The shared
+# TRACKING_SIGMA=0.25 is calibrated for orientation-style errors (order-1 units);
+# for height the error is meters SQUARED, and at 0.25 a 20cm shortfall costs only
+# ~15% of the term -- which is exactly why three full runs settled into SITTING ON
+# THE FOLDED CALVES ~20-30cm below target instead of standing on the feet: the
+# contact sensor can't tell foot-tip contact from whole-calf contact (the foot IS
+# part of the calf body in the model), so base height is the ONLY physical signal
+# separating a true feet-stance from calf-sitting, and it was priced almost flat.
+# 0.02 -> 0.06 (v6.1, SAME NIGHT, 6100-it postmortem): 0.02 overshot into the
+# opposite failure -- vanishing gradient. It needs a full 30cm climb (quadruped
+# 0.55 -> target 0.85); at 0.02 even 10cm short (most of that climb) only scores
+# 0.61, 20cm short scores 0.14 -- almost no usable signal across the range the
+# policy actually has to cross, only right at the very top. Three checkpoints
+# (it2498/4400/6100) confirmed this empirically: height reward stayed flat at
+# ~4-5% of max the entire time, identical pose in every frame, zero visible
+# climbing attempt -- not "learning slowly", genuinely no gradient to climb.
+# At 0.06: 10cm short ~0.85, 20cm short ~0.51, 30cm short ~0.22 -- smooth
+# pressure across the whole climb, still clearly discriminates calf-sitting
+# (severe shortfall) from a real stand (small shortfall).
+# 0.06 -> 0.005 (v6.2, SAME NIGHT, second postmortem on the sigma itself):
+# 0.06 was calibrated for the OLD 30cm climb (0.55->0.85). Lowering
+# STAND_HEIGHT_TARGET to 0.62 (geometry fix, see its own comment) shrank the
+# climb the ramped `target` actually spans to just 7cm (0.55->0.62) -- and
+# 0.06 against a 7cm span is enormously permissive: sitting at PLAIN
+# quadruped height (0cm risen, the full 7cm short) still scored exp(-0.07^2/
+# 0.06)=0.92, ~92% of max, for not standing up AT ALL. Three checkpoints
+# (it9200/12400/13500) confirmed empirically: height reward plateaued
+# 1.2-1.9/8.0 with visually IDENTICAL pose across ~4000 iterations -- the
+# policy had almost no incentive to climb the remaining 7cm since "barely
+# risen" already captured nearly the whole reward. At 0.005: fully risen=1.0,
+# 3cm short=0.84, 5cm short=0.61, 7cm short (not risen)=0.38 -- real pressure
+# across the now-much-shorter climb. General lesson: this sigma must scale
+# with (STAND_HEIGHT_TARGET - 0.55), not stay fixed across target changes.
+HEIGHT_TRACKING_SIGMA = 0.005
+
+
 def rear_stand_height(env, asset_cfg=None) -> torch.Tensor:
     """exp-tracking of the vertical-stand base height (flat plane -> world Z is
     ground-true). Ramped with the same clock as orientation so the two references
@@ -322,7 +427,161 @@ def rear_stand_height(env, asset_cfg=None) -> torch.Tensor:
     # From the quadruped stand (0.55) up to the rear-stand target, led by the command.
     target = 0.55 + (STAND_HEIGHT_TARGET - 0.55) * signal
     err = torch.square(asset.data.root_pos_w[:, 2] - target)
+    # v6: HEIGHT_TRACKING_SIGMA (own, sharp) -- see its comment above.
+    return torch.exp(-err / HEIGHT_TRACKING_SIGMA)
+
+
+# v6.5 (2026-08-18): owner's proposal, relayed via claude-tg-base after reading
+# this file end-to-end + go2_stand's own reward set -- rear_stand_height above
+# only measures root_pos_w[:,2]. Nothing prices the REAR knee angle directly, so
+# "torso tilted enough to lift root height while the knee stays folded" scores
+# exactly as well as a genuine feet-stance. That's precisely v6.4's final
+# plateau: orientation solved (torso vertical), height stuck ~0.6-0.75/8.0,
+# rear knees still visibly more bent than the Go2 reference. This constant is
+# the calf-joint target that closes that hole -- see
+# rear_stand_rear_leg_extension's own docstring for the full mechanism.
+# Picked from the calf joint's own physical limits (b2.urdf: RL/RR_calf_joint
+# range [-2.82, -0.43] rad, default quadruped pose -1.5) -- -0.43 is the
+# mechanical near-straight limit, same class of singularity as the 0.70m
+# hip-to-foot ceiling already found for STAND_HEIGHT_TARGET. -0.65 leaves
+# ~0.22 rad margin from that limit, same "leave headroom from the
+# singularity" logic as STAND_HEIGHT_TARGET's own 0.62m (89% of 0.70m).
+# FIRST GUESS, not empirically calibrated against what training actually
+# produces -- expect this may need a postmortem-driven revision same as
+# STAND_HEIGHT_TARGET/HEIGHT_TRACKING_SIGMA both needed tonight.
+REAR_LEG_EXTENSION_TARGET = -0.65
+
+
+def rear_stand_rear_leg_extension(env, asset_cfg=None) -> torch.Tensor:
+    """exp-tracking of the REAR (RL/RR) calf-joint angle toward
+    REAR_LEG_EXTENSION_TARGET, ramped by the SAME command signal as
+    rear_stand_height (folded at idle, extended once fully risen) but
+    completely DECOUPLED from root height itself -- see
+    REAR_LEG_EXTENSION_TARGET's own comment for the full diagnosis/rationale.
+
+    Uses the file's shared TRACKING_SIGMA=0.25 rather than a new custom sigma
+    -- that constant already tracks two other joint-angle terms in this file
+    (rear_stand_hip_pos, rear_stand_front_legs_tuck) without needing its own
+    calibration saga; height's own dedicated sigma needed THREE postmortems
+    in one night (0.06->0.02->0.005) precisely because it was recalibrated in
+    isolation from its actual target span -- reusing a sigma already proven
+    to work on this same class of term (rad^2 joint error) is the lower-risk
+    choice for a first attempt.
+
+    Deliberately scoped to CALF only, not thigh -- the diagnosed cheat
+    (pelvis tilt substituting for knee extension) is specifically a knee
+    phenomenon, and thigh_joint's sign convention wasn't verified against
+    URDF geometry with the same confidence as calf's (calf's range/meaning is
+    directly documented via STAND_HEIGHT_TARGET's own geometry comment); a
+    wrong-sign thigh term could actively fight standing rather than help.
+    Revisit if calf-alone proves insufficient."""
+    asset = env.scene[asset_cfg.name if asset_cfg is not None else "robot"]
+    joint_names = asset.joint_names
+    ids = [i for i, n in enumerate(joint_names) if n in ("RL_calf_joint", "RR_calf_joint")]
+    default = asset.data.default_joint_pos[:, ids]
+    signal = env.command_manager.get_term("base_velocity").signal.unsqueeze(-1)
+    target = default + (REAR_LEG_EXTENSION_TARGET - default) * signal
+    err = torch.sum(torch.square(asset.data.joint_pos[:, ids] - target), dim=1)
     return torch.exp(-err / TRACKING_SIGMA)
+
+
+# v7 (2026-08-18, "handstand" redesign): owner's proposal relayed via
+# claude-tg-base, pointing at THIS SAME fork's own `config/others/
+# unitree_a1_handstand/` task (rewards.py + rough_env_cfg.py) as a design
+# reference. Their whole task is built around ONE dominant anchor --
+# `handstand_feet_height_exp`, exp-tracking the AIRBORNE feet's world-Z
+# height, weight 10, clearly dominant over their orientation term (-1) -- not
+# root/base height at all. That's a geometrically stronger signal than
+# rear_stand_height above: root height can be partly farmed by pelvis tilt
+# with the rear knee still folded (v6.4's diagnosed plateau, v6.5's
+# rear_leg_extension attacks the same hole from the joint-angle side); FRONT
+# PAW height cannot be faked that way -- lifting the front paws to a genuine
+# standing height requires the whole kinematic chain (rear knee extension +
+# torso verticality) to actually be right at once, not just root_pos_w[:,2].
+#
+# IMPORTANT CORRECTION to the relayed suggestion: the message named
+# `handstand_type="back"` as "стойка на задних лапах" (rear-leg stand, our
+# goal). Verified directly against their rough_env_cfg.py + IsaacLab's own
+# body-name regex resolution (isaaclab/utils/string.py uses re.fullmatch,
+# confirmed empirically): handstand_type="back" sets
+# `air_foot_name = "R.*_foot"`, which fullmatches ONLY "RR_foot"/"RL_foot"
+# (REAR feet) -- i.e. "back" tracks the REAR feet as the ones meant to be
+# airborne, meaning the robot balances on its FRONT legs (a literal
+# handstand, tail end up) -- the OPPOSITE of what we want. `handstand_type
+# ="front"` (air_foot_name="F.*_foot", target_gravity=[-1,0,0]) is the one
+# that tracks FRONT feet as airborne, i.e. balancing on REAR/hind legs, nose
+# up -- this matches our own rear_stand_orientation_tracking's own documented
+# convention exactly ("nose-up vertical" -> rear feet as the support base).
+# Ported the FRONT-airborne logic below, not "back" as literally suggested --
+# flagged explicitly back to the owner/claude-tg-base for review since this
+# was the load-bearing parameter of the whole port.
+#
+# Target height: not derived with STAND_HEIGHT_TARGET's clean 2-link-IK
+# confidence (that needs the WHOLE kinematic chain incl. body length, not
+# just one leg) -- reasoned estimate only. b2.urdf: base_link -> front hip
+# offset is 0.3285m along body-local X; once vertical that offset becomes
+# vertical, so front-hip height once fully risen ~= STAND_HEIGHT_TARGET
+# (0.62) + 0.3285 =~ 0.95m. Target set a bit under that (0.85m) to leave the
+# front leg some functional bend rather than assume full extension. FIRST
+# GUESS -- expect this needs the same postmortem-driven recalibration
+# STAND_HEIGHT_TARGET/HEIGHT_TRACKING_SIGMA both needed tonight; 0.15 is the
+# idle (4-leg stance) front-paw height baseline the ramp starts from.
+FRONT_FEET_HEIGHT_TARGET = 0.85
+FRONT_FEET_IDLE_HEIGHT = 0.15
+# Sigma: reused from their own reference value (std=sqrt(0.25) -> sigma=0.25
+# in this file's exp(-err/sigma) convention) rather than derived from
+# scratch -- it's the literal value their working reference uses for this
+# exact term, applied to a similarly-scaled (sub-meter) height-error span;
+# also happens to equal this file's own shared TRACKING_SIGMA, so no new
+# untested constant is introduced. Lower-risk than a from-scratch derivation
+# after tonight's THREE-postmortem sigma saga on rear_stand_height itself.
+FRONT_FEET_HEIGHT_SIGMA = TRACKING_SIGMA
+
+
+def rear_stand_front_feet_height(env, asset_cfg=None) -> torch.Tensor:
+    """exp-tracking of the FRONT (FL/FR) paw world-Z height toward
+    FRONT_FEET_HEIGHT_TARGET, ramped by the same command signal as height/
+    orientation (idle baseline -> full target once risen). See
+    FRONT_FEET_HEIGHT_TARGET's own comment for the full "handstand" redesign
+    rationale and the handstand_type correction. NEW dominant anchor --
+    rear_stand_height stays active as a secondary signal (weight reduced),
+    not replaced outright."""
+    asset = env.scene[asset_cfg.name if asset_cfg is not None else "robot"]
+    body_names = asset.body_names
+    ids = [body_names.index("FL_calf"), body_names.index("FR_calf")]
+    feet_height = asset.data.body_pos_w[:, ids, 2]
+    signal = env.command_manager.get_term("base_velocity").signal.unsqueeze(-1)
+    target = FRONT_FEET_IDLE_HEIGHT + (FRONT_FEET_HEIGHT_TARGET - FRONT_FEET_IDLE_HEIGHT) * signal
+    err = torch.sum(torch.square(feet_height - target), dim=1)
+    return torch.exp(-err / FRONT_FEET_HEIGHT_SIGMA)
+
+
+def rear_stand_front_feet_on_air(env, sensor_cfg=None) -> torch.Tensor:
+    """Ported from unitree_a1_handstand's own handstand_feet_on_air (front
+    feet in first-air state). Gated on risen (signal>0.9, same threshold as
+    rear_stand_front_legs_tuck/rear_stand_com_over_support) -- their original
+    is ungated because their task has no idle/four-leg phase at all; ours
+    does, and front feet belong ON the ground during idle/rise."""
+    contact_sensor = env.scene.sensors[sensor_cfg.name]
+    first_air = contact_sensor.compute_first_air(env.step_dt)[:, sensor_cfg.body_ids]
+    reward = torch.all(first_air, dim=1).float()
+    risen = (env.command_manager.get_term("base_velocity").signal > 0.9).float()
+    return reward * risen
+
+
+def rear_stand_front_feet_air_time(env, sensor_cfg=None, threshold: float = 3.0) -> torch.Tensor:
+    """Ported from unitree_a1_handstand's own handstand_feet_air_time
+    (rewards sustained front-feet air time past `threshold`). Their own
+    threshold=5.0 was calibrated against a fixed 10s episode with no idle
+    phase; ours holds 8-14s (hold_time_range) on top of a 2s rise, so 3.0 is
+    a scaled-down FIRST GUESS, not a derived value -- same gating as
+    rear_stand_front_feet_on_air, for the same reason."""
+    contact_sensor = env.scene.sensors[sensor_cfg.name]
+    first_contact = contact_sensor.compute_first_contact(env.step_dt)[:, sensor_cfg.body_ids]
+    last_air_time = contact_sensor.data.last_air_time[:, sensor_cfg.body_ids]
+    reward = torch.sum((last_air_time - threshold) * first_contact, dim=1)
+    risen = (env.command_manager.get_term("base_velocity").signal > 0.9).float()
+    return reward * risen
 
 
 def rear_stand_com_over_support(env, asset_cfg=None) -> torch.Tensor:
@@ -487,6 +746,49 @@ def rear_stand_hip_pos(env, asset_cfg=None) -> torch.Tensor:
     return torch.exp(-err / TRACKING_SIGMA)
 
 
+def rear_stand_front_legs_tuck(env, asset_cfg=None) -> torch.Tensor:
+    """exp-tracking of the FRONT legs' thigh+calf joints to their default
+    angles while risen (added 2026-08-12, bench on the v5 13600 checkpoint:
+    right front paw raised and waving, both front legs in visible tremor).
+
+    Pricing hole: once vertical, the front legs are airborne by design --
+    front_feet_contact prices touching the ground, hip_pos anchors the 4 hip
+    ab/ad joints, but the front THIGH and CALF joints while risen were never
+    priced by anything (stand_still_without_cmd/joint_pos_penalty are zeroed
+    task-wide, idle_joint_pose gates to signal<0.1) -- a free variable for the
+    entire life of the task, waving/tremor is just where it drifted. (The
+    bench clock mismatch -- 13600 was tested against a 2x-fast gait metronome,
+    see b2_policy.py's own note -- may have amplified the tremor, but the hole
+    is real regardless and costs nothing to close.) Same exp/TRACKING_SIGMA
+    idiom as rear_stand_hip_pos, gated on the commanded signal so the rise and
+    descend transitions stay free to move the legs."""
+    asset = env.scene[asset_cfg.name if asset_cfg is not None else "robot"]
+    joint_names = asset.joint_names
+    ids = [
+        i for i, n in enumerate(joint_names)
+        if n in ("FL_thigh_joint", "FL_calf_joint", "FR_thigh_joint", "FR_calf_joint")
+    ]  # fmt: skip
+    err = torch.sum(torch.square(asset.data.joint_pos[:, ids] - asset.data.default_joint_pos[:, ids]), dim=1)
+    risen = (env.command_manager.get_term("base_velocity").signal > 0.9).float()
+    return torch.exp(-err / TRACKING_SIGMA) * risen
+
+
+def rear_stand_no_flight(env, sensor_cfg=None) -> torch.Tensor:
+    """Penalty when BOTH rear feet are out of contact while risen (added
+    2026-08-12, bench on 13600: commanded forward, the robot doesn't step --
+    it micro-HOPS in place). A biped WALK always keeps at least one foot
+    planted; a hop launches both. Nothing priced that: the gait-schedule
+    reward only scores per-foot contact matching, and a well-timed hop can
+    roughly satisfy an alternating schedule around the double-support windows
+    while going nowhere. Walking (the desired gait) pays this zero by
+    construction; only genuinely ballistic ticks pay."""
+    contact_sensor = env.scene.sensors[sensor_cfg.name]
+    in_contact = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :].norm(dim=-1) > 1.0
+    both_off = (~in_contact).all(dim=1).float()
+    risen = (env.command_manager.get_term("base_velocity").signal > 0.9).float()
+    return both_off * risen
+
+
 def rear_stand_low_speed(env, asset_cfg=None) -> torch.Tensor:
     """v4: coarse threshold penalty on walking speed vs command -- go2_stand's own
     _reward_low_speed, ported. rear_stand_walk_tracking's exp-kernel is forgiving
@@ -633,10 +935,52 @@ class UnitreeB2RearStandRoughEnvCfg(UnitreeB2RoughEnvCfg):
             func=rear_stand_orientation_tracking, weight=8.0, params={"asset_cfg": SceneEntityCfg("robot")}
         )
         self.rewards.rear_stand_height = RewTerm(
-            func=rear_stand_height, weight=3.0, params={"asset_cfg": SceneEntityCfg("robot")}
+            # 3.0 -> 8.0 (v6 stand-only): height is the ONE signal separating a
+            # true feet-stance from sitting on folded calves (see
+            # HEIGHT_TRACKING_SIGMA's comment) -- promote it to the same dominant
+            # tier as orientation (8.0) so "stand tall on the feet" outbids the
+            # safe low crouch, paired with the sharp per-term sigma.
+            # 8.0 -> 4.0 (v7, 2026-08-18, handstand redesign): root height is
+            # no longer the SOLE/dominant standing signal -- demoted to a
+            # secondary anchor now that rear_stand_front_feet_height (10.0,
+            # below) owns primary authority. Not zeroed: still a useful,
+            # cheap-to-satisfy-honestly signal, just no longer load-bearing
+            # alone.
+            func=rear_stand_height, weight=4.0, params={"asset_cfg": SceneEntityCfg("robot")}
+        )
+        # v7 (2026-08-18, handstand redesign): the NEW dominant anchor -- see
+        # FRONT_FEET_HEIGHT_TARGET's own comment for the full mechanism/
+        # rationale/handstand_type correction. Weight 10.0 mirrors
+        # unitree_a1_handstand's own proportions (their feet_height_exp=10 vs
+        # orientation=-1, clearly dominant); scaled here against our own
+        # orientation=8/height=4 rather than copied blindly.
+        self.rewards.rear_stand_front_feet_height = RewTerm(
+            func=rear_stand_front_feet_height, weight=10.0, params={"asset_cfg": SceneEntityCfg("robot")}
+        )
+        self.rewards.rear_stand_front_feet_on_air = RewTerm(
+            func=rear_stand_front_feet_on_air,
+            weight=5.0,
+            params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=["FL_calf", "FR_calf"])},
+        )
+        self.rewards.rear_stand_front_feet_air_time = RewTerm(
+            func=rear_stand_front_feet_air_time,
+            weight=5.0,
+            params={
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["FL_calf", "FR_calf"]),
+                "threshold": 3.0,
+            },
         )
         self.rewards.rear_stand_com_over_support = RewTerm(
             func=rear_stand_com_over_support, weight=2.0, params={"asset_cfg": SceneEntityCfg("robot")}
+        )
+        # v6.5 (2026-08-18): closes the "pelvis tilt substitutes for knee
+        # extension" hole diagnosed in v6.4's postmortem -- see
+        # REAR_LEG_EXTENSION_TARGET's own comment for the full mechanism.
+        # Weighted just under height/orientation (8.0) -- this is a primary
+        # co-objective (height alone is gameable without it), not a minor
+        # backstop like hip_pos/front_legs_tuck (3.0/2.0).
+        self.rewards.rear_stand_rear_leg_extension = RewTerm(
+            func=rear_stand_rear_leg_extension, weight=6.0, params={"asset_cfg": SceneEntityCfg("robot")}
         )
         # v4 (2026-08-09): unconditional hip anchor, go2_stand's own hip_pos
         # ported -- see the function's own docstring. Weight matched to
@@ -644,6 +988,42 @@ class UnitreeB2RearStandRoughEnvCfg(UnitreeB2RoughEnvCfg):
         # orientation's 8/height's 3 proportions, per this block's own comment).
         self.rewards.rear_stand_hip_pos = RewTerm(
             func=rear_stand_hip_pos, weight=3.0, params={"asset_cfg": SceneEntityCfg("robot")}
+        )
+        # New 2026-08-12 (bench on v5's 13600: front-leg tremor + a raised
+        # waving paw -- see rear_stand_front_legs_tuck's own docstring).
+        # Weight 2.0 -- secondary-anchor scale, same tier as feet_clearance.
+        # 2.0 -> 0 (v7, 2026-08-18, handstand redesign): DIRECTLY CONFLICTS
+        # with the new dominant rear_stand_front_feet_height -- this term
+        # anchors front thigh+calf toward the DEFAULT (folded, low) quadruped
+        # angle while risen, exactly opposing "lift the front paws high".
+        # front_feet_height now gives the front legs a genuine job (reach a
+        # target height) instead of leaving them a free variable, which was
+        # this term's whole original purpose -- superseded, not just
+        # redundant.
+        self.rewards.rear_stand_front_legs_tuck = RewTerm(
+            func=rear_stand_front_legs_tuck, weight=0.0, params={"asset_cfg": SceneEntityCfg("robot")}
+        )
+        # New 2026-08-12 (bench on v5's 13600: micro-hopping in place instead
+        # of stepping -- see rear_stand_no_flight's own docstring).
+        # -2.0 -> -6.0 (v5.2, 2026-08-16, owner bench verdict on the v5.1 FINAL
+        # 19999: "просто встаёт и пытается прыгать мелко на двух ногах, никакой
+        # походки". Sequence-frame review confirmed hopping, not walking (see
+        # TRAINING_STATE.md ~12:00/TRAIN_RESEARCH's "stop-frame vs walking"
+        # entry). Root cause: `rear_stand_no_flight` held FLAT at -1.0..-1.1
+        # episode-mean the ENTIRE 20000-it run -- the fix term never gained
+        # traction. Economics check against rear_stand_rear_feet_contact
+        # (weight=3.0, below): a hop landing during a SINGLE-support window
+        # still matches the gait mask on the one foot that's ALSO supposed to
+        # be airborne (_gait_mask is per-foot, not "both or neither"), earning
+        # partial credit (weight*1=3.0) that -2.0 here didn't outweigh --
+        # hopping was cheaper than learning genuine single-leg balance.
+        # -6.0 flips that: hop nets 3.0-6.0=-3.0 on this pair alone, a clean
+        # single-support step still nets the full 3.0*2=6.0 walking bonus
+        # untouched (no_flight only fires when BOTH feet are off).
+        self.rewards.rear_stand_no_flight = RewTerm(
+            func=rear_stand_no_flight,
+            weight=-6.0,
+            params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=["RL_calf", "RR_calf"])},
         )
         self.rewards.rear_stand_front_feet_contact = RewTerm(
             func=rear_stand_front_feet_contact,

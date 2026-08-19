@@ -122,7 +122,20 @@ class JumpPulseCommandCfg(CommandTermCfg):
     # hind-leg-dominant push drifts the body backward NATURALLY (the overnight
     # checkpoint jumped backward on a forward command), so backward is likely the
     # robot's EASIEST direction, not its hardest.
-    directions: tuple = ((1.0, 0.0), (0.0, 1.0), (0.0, -1.0), (-1.0, 0.0))
+    # v5 FORWARD-ONLY (2026-08-16, owner's staging order after the live verdict
+    # on v4 24999: forward jumps lift only the FRONT feet -- the rear stay
+    # planted -- while backward flies clean with all four airborne; "Убираем все
+    # три! Делаем ТОЛЬКО прыжок вперед! Четкий, ровный высокий прыжок вперед!").
+    # Backward is the robot's free-ride direction (the rear-dominant push drifts
+    # the body backward by itself) and left/right precision was historically
+    # weakest; with all four directions in one run the averaged flight metrics
+    # let the easy backward mask the weak forward all night. Forward-only puts
+    # 100% of training pressure on the one direction that requires genuine
+    # 4-leg launch work. COMPATIBILITY PRESERVED (owner's explicit requirement):
+    # the command layout stays [dir_x, dir_y, phase] and obs stays 45 -- this
+    # tuple only changes what gets SAMPLED, so a forward-only checkpoint
+    # warm-starts a later re-add of the other directions unchanged.
+    directions: tuple = ((1.0, 0.0),)
     debug_vis: bool = False
 
 
@@ -136,7 +149,43 @@ class JumpPulseCommandCfg(CommandTermCfg):
 # reward is live WHEN, so the crouch->launch ordering is shaped explicitly instead
 # of hoping exploration discovers it (it didn't -- see the squat-pogo post-mortem).
 CROUCH_PHASE_END = 0.35
-CROUCH_TARGET_HEIGHT = 0.20  # base height with the belly nearly on the ground
+# 0.20 -> 0.35 (2026-08-12, bench verdict on 34999: "сильно приседает" -- the
+# belly-low fold reads as a violent wind-up, and the real B2 reference video
+# jumps from a SOFT knee bend, not a full fold. 0.35 from a 0.53 stand is that
+# soft spring-load; the launch terms carry the rest.)
+# 0.35 -> 0.30 (2026-08-12 evening, jump v2 run stalled: flight pinned at
+# exactly 0.000 through it8400 with vertical_launch creeping 0.32->0.35 and no
+# acceleration -- the v1 lineage had flight ~0.55 by the same iteration. The
+# soft bend cut the leg-extension stroke too far AND feet_planted removed the
+# re-stepping wind-up, leaving no ignition path. 0.30 returns part of the
+# stroke while staying far from the old belly-low 0.20; paired with
+# vertical_launch 8->10 below. Applied under the user's standing grant
+# ("останавливать, изменять, запускать по новой -- можешь сам").)
+CROUCH_TARGET_HEIGHT = 0.30  # base height at the bottom of the soft pre-jump bend
+# v3->v4 (2026-08-16, owner bench verdict on 24999: "еле-еле прыгает", flight_distance
+# down ~30% vs the prior checkpoint 33399, 0.22->0.16, despite vertical_launch and
+# direction_velocity holding steady). Root cause traced to jump_airborne_front_leg_pose
+# (added the night before): its gate was `phase >= CROUCH_PHASE_END`, so it fired
+# from 0.35 onward -- covering LAUNCH (0.35-0.60, the explosive extension itself),
+# not just true airborne coasting/landing-prep. Anchoring the front legs to the
+# STANDING default pose during the push penalized the very leg extension a real
+# launch needs, teaching a timid push instead of fixing the intended bug (a leg
+# frozen mid-fold through flight). LAUNCH_PHASE_END names the boundary this term
+# should have used from the start -- gates jump_airborne_front_leg_pose only, not
+# jump_airborne_leg_stillness (unchanged since 2026-08-09, coexisted fine with
+# 33399's own good flight_distance, not a new variable in this regression).
+LAUNCH_PHASE_END = 0.60
+
+# v6 (2026-08-19, positive landing package -- see jump_landing_pose/
+# jump_landing_height_stance/jump_landing_still_bonus's own docstrings for
+# the full rationale). All three FIRST GUESSES, not empirically calibrated --
+# picked sharp enough to demand a genuine return-to-stance (softer than this
+# file's shared TRACKING_SIGMA=0.25 equivalent would barely discriminate a
+# good landing from a mediocre one), not copied from Atanassov's own sigma
+# (their units/error-summation differ from ours).
+JUMP_LANDING_POSE_SIGMA = 0.1
+JUMP_LANDING_HEIGHT_SIGMA = 0.02
+JUMP_LANDING_STILL_SIGMA = 0.5
 
 
 def _feet_airborne(env, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
@@ -232,6 +281,57 @@ def jump_crouch(env, command_name: str) -> torch.Tensor:
     return err * in_crouch.float()
 
 
+def jump_crouch_feet_planted(env, command_name: str, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Feet must stay PLANTED AND STILL through the crouch (added 2026-08-12,
+    bench verdict on 34999: during the pre-jump fold the dog rapidly re-steps,
+    SPLAYS the feet wide and slams them into the floor -- "ОЧЕНЬ сильно бьет по
+    полу". The reference video jump starts from a plain stand: no foot ever
+    moves, the legs just bend and spring).
+
+    Root cause is a pricing hole: jump_crouch prices base HEIGHT during the
+    fold and jump_idle_still prices BASE velocity, but what the feet do during
+    the crouch was completely free -- lifting, re-stepping, splaying and
+    slamming all cost nothing (the master free-variable lesson, instance N;
+    landing_impact only fires in the landing slice). Priced two ways at once:
+    (a) each foot OUT of contact during the crouch pays (you cannot re-step or
+    slam a foot that never leaves the ground -- and a foot that never leaves
+    its print cannot splay either), (b) horizontal foot speed while IN contact
+    pays (no sliding the feet outward along the floor instead). Both bounded
+    by construction (contact count <= 4, speed clamped) -- the
+    unbounded-squared-term postmortems elsewhere in this file stay respected."""
+    term = env.command_manager.get_term(command_name)
+    asset = env.scene["robot"]
+    contact_sensor = env.scene.sensors[sensor_cfg.name]
+    forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]
+    in_contact = torch.linalg.norm(forces, dim=-1) > 1.0  # [N,4]
+    off_ground = (~in_contact).float().sum(dim=1)
+    # Horizontal speed of feet that ARE in contact = sliding/shuffling.
+    foot_vel = asset.data.body_lin_vel_w[:, sensor_cfg.body_ids, 0:2]
+    slip = (torch.linalg.norm(foot_vel, dim=-1).clamp(max=3.0) * in_contact.float()).sum(dim=1)
+    in_crouch = term.window_active & (term.phase < CROUCH_PHASE_END)
+    return (off_ground + slip) * in_crouch.float()
+
+
+def jump_launch_attitude(env, command_name: str) -> torch.Tensor:
+    """Penalize roll/pitch (body tilting away from level) through the
+    post-crouch window (added 2026-08-12, bench verdict on 34999: the backward
+    jump lifts the rear high into the air -- "попу поднимает сильно" -- and
+    barely lands on balance). The inherited `upward` reward (3.0) prices this
+    too weakly against launch terms at 8: a hind-dominant push can buy a big
+    pitch-up cheaply. Squared world-frame roll+pitch rate is NOT used --
+    attitude itself is the problem, so price the gravity-projected tilt
+    directly (same quantity flat-orientation terms use everywhere else).
+    Active post-crouch through the window (launch + flight): a level body at
+    takeoff lands level -- the trajectory is ballistic."""
+    term = env.command_manager.get_term(command_name)
+    asset = env.scene["robot"]
+    # projected_gravity_b xy components are 0 when the body is level.
+    g_xy = asset.data.projected_gravity_b[:, 0:2]
+    tilt = torch.sum(torch.square(g_xy), dim=1)
+    in_free = term.window_active & (term.phase >= CROUCH_PHASE_END)
+    return tilt * in_free.float()
+
+
 def jump_motor_speed_violation(env, asset_cfg=None) -> torch.Tensor:
     """Penalty on leg joint velocity exceeding its REAL hardware speed rating
     (hip/thigh 23 rad/s, calf 14 rad/s), everywhere (no phase gate -- both launch
@@ -301,6 +401,59 @@ def jump_airborne_leg_stillness(env, command_name: str, sensor_cfg: SceneEntityC
     airborne = _feet_airborne(env, sensor_cfg)
     post_crouch = term.window_active & (term.phase >= CROUCH_PHASE_END)
     return torch.sum(torch.square(normalized), dim=1) * (airborne & post_crouch).float()
+
+
+def jump_airborne_front_leg_pose(env, command_name: str, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
+    """L1 penalty on FRONT leg (thigh+calf) deviation from default pose while
+    genuinely airborne (post-crouch) -- added 2026-08-14, bench verdict on
+    jump_33399: backward jumps tuck the front-right leg through the whole
+    flight, forward/left/right don't (owner's exact words: "назад опять
+    правую переднюю подгибает").
+
+    Root cause (code-verified, not guessed): this module's own JumpPulseCommand
+    docstring already notes backward is the robot's naturally EASIEST launch
+    direction -- the hind-leg-dominant push drifts the body backward for free,
+    so on a backward command the front legs do far less active push-work than
+    they do fighting that natural bias on forward/left/right. A front leg that
+    never had to work can end up passively mid-fold right at liftoff.
+    jump_airborne_leg_stillness (2026-08-09) then makes things worse for THAT
+    specific case: it penalizes JOINT VELOCITY while airborne, which makes
+    freezing wherever the leg already is the cheapest option -- it rewards
+    freezing at a bad fold exactly as much as freezing at a clean extended
+    pose, since it has no notion of WHERE, only of not moving. Free variable,
+    same class of gap as jump_crouch_feet_planted/jump_idle_symmetry
+    elsewhere in this file.
+
+    Front legs only, thigh+calf (not hip, not rear) -- same joint selection
+    as rear_stand's own rear_stand_front_legs_tuck fix for an analogous
+    front-leg-tremor bug. Rear legs deliberately excluded: they are mid-
+    push-through at the moment of liftoff, anchoring them to the STANDING
+    default would fight the very extension that makes the jump happen.
+    Plain L1 (not squared/exp) -- bounded by joint range by construction,
+    same unbounded-term discipline as every other term in this file, and it
+    only needs to NUDGE the stillness term's chosen freeze-point, not fight
+    it outright.
+
+    v4 fix (2026-08-16): gate moved CROUCH_PHASE_END (0.35) -> LAUNCH_PHASE_END
+    (0.60) -- see LAUNCH_PHASE_END's own comment for the full postmortem.
+    The original gate fired from the START of LAUNCH (0.35-0.60, the explosive
+    push itself), penalizing front-leg extension during the very push that
+    makes a strong jump, not just a bad pose held through true flight/landing.
+    Bench verdict on 24999 confirmed the cost: flight_distance -30% vs the
+    prior checkpoint (33399) despite vertical_launch/direction_velocity
+    holding steady -- distance/duration regressed, launch power didn't, which
+    is exactly what over-anchoring the LAUNCH-phase leg would produce."""
+    term = env.command_manager.get_term(command_name)
+    asset = env.scene["robot"]
+    joint_names = asset.joint_names
+    ids = [
+        i for i, n in enumerate(joint_names)
+        if n in ("FL_thigh_joint", "FL_calf_joint", "FR_thigh_joint", "FR_calf_joint")
+    ]  # fmt: skip
+    err = torch.sum(torch.abs(asset.data.joint_pos[:, ids] - asset.data.default_joint_pos[:, ids]), dim=1)
+    airborne = _feet_airborne(env, sensor_cfg)
+    past_launch = term.window_active & (term.phase >= LAUNCH_PHASE_END)
+    return err * (airborne & past_launch).float()
 
 
 def jump_landing_impact(env, command_name: str, sensor_cfg: SceneEntityCfg, soft_threshold: float) -> torch.Tensor:
@@ -509,6 +662,79 @@ def jump_landing_settle(env, command_name: str) -> torch.Tensor:
     return (ang + lin_xyz) * term.landing_active.float()
 
 
+# v6 (2026-08-19, "clean forward jump" task from the owner via claude-tg-base):
+# the landing-quality economy above (jump_landing_settle/jump_landing_impact)
+# is entirely NEGATIVE -- small penalties (-1.5/-2.0) for a bad landing, with
+# NOTHING positively rewarding a GOOD one. Research found a working real-
+# hardware jump recipe on the SAME stack (Atanassov et al., arXiv:2401.16337,
+# legged_gym+rsl_rl, Go1 90cm forward jump, code open) whose landing economy
+# is class-different: a DOMINANT POSITIVE package (change_of_contact=10,
+# default_pose=12, base_height_stance=20, post_landing_pos/ori at a very
+# sharp sigma) rather than small deterrents. Ported the CONCEPT, not their
+# literal numbers (different overall reward economy, different sigma scale
+# already established in this file) -- four new terms below, all gated on
+# `landing_active` (the same phase flag jump_landing_settle/jump_landing_impact
+# already use), all POSITIVE exp-kernel rewards that STACK ON TOP OF the
+# existing penalties rather than replacing them (a bad landing still costs
+# via settle/impact; a good one now ALSO earns, instead of just costing
+# nothing).
+def jump_landing_pose(env, command_name: str, asset_cfg=None) -> torch.Tensor:
+    """Positive: exp-tracking of ALL leg joints back to the default stance
+    during the landing slice -- Atanassov's own `default_pose`. Sharp-ish
+    sigma (this file's shared TRACKING_SIGMA scale would be too soft for a
+    "snap back to stance" signal) -- first guess, not empirically calibrated,
+    expect revision same as every other sigma in this codebase's history."""
+    term = env.command_manager.get_term(command_name)
+    asset = env.scene[asset_cfg.name if asset_cfg is not None else "robot"]
+    joint_names = asset.joint_names
+    leg_ids = [i for i, n in enumerate(joint_names) if n.endswith(("_hip_joint", "_thigh_joint", "_calf_joint"))]
+    err = torch.sum(torch.square(asset.data.joint_pos[:, leg_ids] - asset.data.default_joint_pos[:, leg_ids]), dim=1)
+    return torch.exp(-err / JUMP_LANDING_POSE_SIGMA) * term.landing_active.float()
+
+
+def jump_landing_height_stance(env, command_name: str, target_height: float) -> torch.Tensor:
+    """Positive: exp-tracking of base height back to the standing target
+    during the landing slice -- Atanassov's own `base_height_stance`.
+    Complements jump_idle_height (which deliberately EXCLUDES landing_active,
+    see its own docstring) by covering exactly the window that term skips."""
+    term = env.command_manager.get_term(command_name)
+    asset = env.scene["robot"]
+    err = torch.square(asset.data.root_pos_w[:, 2] - target_height)
+    return torch.exp(-err / JUMP_LANDING_HEIGHT_SIGMA) * term.landing_active.float()
+
+
+def jump_landing_feet_planted(env, command_name: str, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Positive: all four feet in ground contact during the landing slice --
+    Atanassov's own `change_of_contact` (they price the DERIVATIVE of contact
+    state changing; this prices the STATE directly -- simpler, same effect:
+    a foot that keeps leaving and retouching the ground during landing_active
+    never holds full 4-contact for long, so a bouncy landing scores low on
+    every step it's airborne, exactly where change_of_contact would also
+    dock it)."""
+    term = env.command_manager.get_term(command_name)
+    contact_sensor = env.scene.sensors[sensor_cfg.name]
+    forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]
+    in_contact = (torch.linalg.norm(forces, dim=-1) > 1.0).float()
+    all_four = in_contact.sum(dim=1) / 4.0
+    return all_four * term.landing_active.float()
+
+
+def jump_landing_still_bonus(env, command_name: str) -> torch.Tensor:
+    """Positive companion to jump_landing_settle's existing penalty: exp-reward
+    for near-zero residual base velocity (linear+angular) during the landing
+    slice -- Atanassov's own `post_landing_pos`/`post_landing_ori` (very sharp
+    sigma in their units; same "first guess, not their literal number" caveat
+    as jump_landing_pose above). jump_landing_settle keeps penalizing a BAD
+    landing (raw squared, unbounded upside for how bad); this adds a bounded
+    positive signal for a GOOD one, so "landed clean" earns instead of merely
+    not losing."""
+    term = env.command_manager.get_term(command_name)
+    asset = env.scene["robot"]
+    ang = torch.sum(torch.square(asset.data.root_ang_vel_w), dim=1)
+    lin = torch.sum(torch.square(asset.data.root_lin_vel_w), dim=1)
+    return torch.exp(-(ang + lin) / JUMP_LANDING_STILL_SIGMA) * term.landing_active.float()
+
+
 @configclass
 class UnitreeB2JumpRoughEnvCfg(UnitreeB2RoughEnvCfg):
     """See module docstring -- discrete triggered jump, not a locomotion gait."""
@@ -591,6 +817,34 @@ class UnitreeB2JumpRoughEnvCfg(UnitreeB2RoughEnvCfg):
             weight=-1.5,
             params={"command_name": "base_velocity"},
         )
+        # v6 (2026-08-19): positive landing package, see the four functions' own
+        # docstrings + JUMP_LANDING_*_SIGMA's own comment. Weighted to genuinely
+        # DOMINATE the small existing landing penalties (settle -1.5, impact -2.0)
+        # without exceeding the launch-phase anchors (vertical_launch 10) -- a
+        # good landing should pay comparably to a good launch push, not less.
+        self.rewards.jump_landing_pose = RewTerm(
+            func=jump_landing_pose,
+            weight=6.0,
+            params={"command_name": "base_velocity", "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.jump_landing_height_stance = RewTerm(
+            func=jump_landing_height_stance,
+            weight=6.0,
+            params={"command_name": "base_velocity", "target_height": 0.53},
+        )
+        self.rewards.jump_landing_feet_planted = RewTerm(
+            func=jump_landing_feet_planted,
+            weight=5.0,
+            params={
+                "command_name": "base_velocity",
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_calf"),
+            },
+        )
+        self.rewards.jump_landing_still_bonus = RewTerm(
+            func=jump_landing_still_bonus,
+            weight=5.0,
+            params={"command_name": "base_velocity"},
+        )
         # New 2026-08-07 (bench: torque/velocity/joint-range bars all red, 100-126%
         # of real hardware -- see jump_motor_speed_violation's own docstring for the
         # verified root cause). Weight moderate: this must discourage a dangerously
@@ -612,6 +866,20 @@ class UnitreeB2JumpRoughEnvCfg(UnitreeB2RoughEnvCfg):
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_calf"),
             },
         )
+        # New 2026-08-14 (bench verdict on jump_33399: backward-only front-right
+        # leg tuck through the whole flight -- see jump_airborne_front_leg_pose's
+        # own docstring for the full root-cause chain). Weight moderate (-2.0,
+        # same tier as jump_motor_speed_violation) -- a nudge toward WHERE to
+        # freeze, deliberately weaker than jump_airborne_leg_stillness's own -3.0
+        # so it doesn't reintroduce the flailing that term was built to stop.
+        self.rewards.jump_airborne_front_leg_pose = RewTerm(
+            func=jump_airborne_front_leg_pose,
+            weight=-2.0,
+            params={
+                "command_name": "base_velocity",
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_calf"),
+            },
+        )
         # Weight history: 1.0 in run 2026-08-04_22-14-17 -- too weak, the exact
         # stand-still optimum returned (vertical_launch flatlined at ~0.02-0.04,
         # noise_std collapsed 1.18->0.67): a vigorous push costs more in action_rate/
@@ -621,6 +889,27 @@ class UnitreeB2JumpRoughEnvCfg(UnitreeB2RoughEnvCfg):
         self.rewards.jump_crouch = RewTerm(
             func=jump_crouch,
             weight=-8.0,
+            params={"command_name": "base_velocity"},
+        )
+        # New 2026-08-12 (bench on 34999: stomping/splaying/re-stepping during
+        # the fold -- see jump_crouch_feet_planted's own docstring). Weighted
+        # strong (-5.0): the user's verdict called this the worst defect, and
+        # the term is bounded so it can't repeat the blowup class.
+        self.rewards.jump_crouch_feet_planted = RewTerm(
+            func=jump_crouch_feet_planted,
+            weight=-5.0,
+            params={
+                "command_name": "base_velocity",
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_calf"),
+            },
+        )
+        # New 2026-08-12 (bench on 34999: backward jump lifts the rear high,
+        # lands barely on balance -- see jump_launch_attitude's own docstring).
+        # Moderate weight: a jump needs SOME pitch freedom, this prices only
+        # the gross tilt that made landings marginal.
+        self.rewards.jump_launch_attitude = RewTerm(
+            func=jump_launch_attitude,
+            weight=-2.0,
             params={"command_name": "base_velocity"},
         )
         self.rewards.jump_landing_impact = RewTerm(
@@ -682,9 +971,13 @@ class UnitreeB2JumpRoughEnvCfg(UnitreeB2RoughEnvCfg):
         #     one and ~8/s for a dash, so jumping wins overall and jumping WITH
         #     the command wins among jumps; flight_distance (8, airborne) widens
         #     the directed margin further.
+        # 8.0 -> 10.0 (2026-08-12 evening, same stall as CROUCH_TARGET_HEIGHT's
+        # own 0.35->0.30 note: with the stomping wind-up priced away, the pure
+        # vertical push needs a steeper gradient to beat the stand-through-the-
+        # window optimum from a standstill).
         self.rewards.jump_vertical_launch = RewTerm(
             func=jump_vertical_launch,
-            weight=8.0,
+            weight=10.0,
             params={"command_name": "base_velocity"},
         )
         self.rewards.jump_direction_velocity = RewTerm(
