@@ -127,10 +127,23 @@ LIFT_BASE_HEIGHT_TARGET = 0.53  # m, unchanged from v7 -- rough's own standing t
 # Unlike rear_stand_rear_leg_extension (which stayed calf-only because thigh's sign
 # wasn't independently verified), BOTH joints are anchored here -- the FK derivation
 # above was carried out explicitly for this file rather than inherited unverified.
-# Still a FIRST GUESS on the exact numbers, same as the rest of this block; if this
-# term measurably fights the height/CoM objectives on the bench, thigh is the one to
-# revisit first (it carries the geometric assumption, calf's role is simpler).
-THIGH_FOLD_TARGET = 2.4  # rad
+#
+# v8.1 FIX (2026-08-19, claude-tg-base's independent review, caught while the
+# first v8 run was live): at THIGH_FOLD_TARGET=2.4, the knee's horizontal
+# offset from the hip is 0.35*sin(2.4)=0.236m -- WAY outside
+# leg_lift_selected_height's own xy_tolerance=0.08 proximity gate. Confirmed
+# in the running TensorBoard log at it1603/20000: leg_lift_selected_height
+# stuck at 0.02-0.05/6.0 while leg_lift_joint_fold climbed steadily
+# (1.28-1.38/4.0) -- the policy was learning to satisfy the fold anchor in a
+# pose the height term's own gate structurally can't reward, exactly the
+# "two co-objectives fighting" risk flagged (and missed) when this constant
+# was first picked. 2.4 -> 3.0 rad: 0.35*sin(3.0)=0.049m, back inside the
+# existing 0.08 tolerance without loosening the gate itself (the gate was
+# proven correct by v7's own backward-sweep fix -- see
+# leg_lift_selected_height's own docstring -- so tightening the FOLD target
+# to fit the PROVEN gate is lower-risk than loosening a gate that already
+# has a track record).
+THIGH_FOLD_TARGET = 3.0  # rad
 CALF_FOLD_TARGET = -2.5  # rad
 
 # Direction mapping v8 (owner's spec, see module docstring) -- forward=FR, right=RR,
