@@ -398,11 +398,23 @@ def leg_lift_foot_horizontal(
 
 
 def leg_lift_base_height(env, command_name: str, target_height: float) -> torch.Tensor:
-    """L2 base-height anchor active while a lift is commanded. Unchanged from v7."""
-    term = env.command_manager.get_term(command_name)
+    """v8.4 FIX (2026-08-19, owner's live bench verdict on v8.3 it500: "сидит на
+    задних лапах, на коленях... СОБАКА ДОЛЖНА СТОЯТЬ"). Was `* term.signal` --
+    active ONLY while a lift is actually commanded, exactly like v7. That left a
+    real gap this file's own rough_env_cfg.py doesn't otherwise cover either
+    (`base_height_l2` is retired to weight=0 for every B2 skill, this
+    command-specific replacement was meant to be its stand-in): at IDLE
+    (signal=0, the vast majority of any episode -- lifts are brief pulses) NO
+    term anchors root height at all. Confirmed live: even at cmd=[0,0,0], root
+    pitch was -16.5 deg and rear hip height 0.37m vs front hip 0.56m (0.19m
+    of front/rear asymmetry) -- a collapsed, kneeling-on-the-rear stance, not a
+    standing one, with nothing in the reward actively opposing it outside an
+    active lift window. ALWAYS active now (the `* term.signal` gate removed) --
+    same target both idle and during a lift (LIFT_BASE_HEIGHT_TARGET is
+    rough's own standing height already, not lift-specific), so this closes
+    the idle gap without needing a second idle-only anchor function."""
     asset = env.scene["robot"]
-    err = torch.square(asset.data.root_pos_w[:, 2] - target_height)
-    return err * term.signal
+    return torch.square(asset.data.root_pos_w[:, 2] - target_height)
 
 
 def leg_lift_base_still(env, command_name: str) -> torch.Tensor:
@@ -568,12 +580,20 @@ class UnitreeB2LegLiftRoughEnvCfg(UnitreeB2RoughEnvCfg):
         self.rewards.stand_still_without_cmd.weight = 0
         self.rewards.joint_pos_penalty.weight = 0
 
-        # v7 values, kept as-is for v8 -- "ровный корпус ВСЕГДА" (owner's rule) plus
-        # the feet_slide fix for the idle-tilt/"кульбит" and dragging-instead-of-
-        # lifting symptoms; both proven on the v2/v7 lineage, not touched by this
-        # round's redesign (which targets the missing POSITIVE mechanisms, not this
-        # pair).
-        self.rewards.flat_orientation_l2.weight = -5.0
+        # v7 value for feet_slide, kept as-is for v8 -- proven fix for the
+        # "кульбит"/dragging symptoms on the v2/v7 lineage, not touched by this
+        # round's redesign.
+        # flat_orientation_l2: -5.0 -> -10.0 (v8.4 FIX, 2026-08-19, owner's live
+        # bench verdict on v8.3 it500: -16.5 deg root pitch even at idle,
+        # "СОБАКА ДОЛЖНА СТОЯТЬ"). "ровный корпус ВСЕГДА" is the owner's own
+        # explicit rule (same one that ORIGINALLY set -5.0) -- -5.0 evidently
+        # wasn't dominant enough once v8 grew the total active-lift reward pot
+        # (same root cause class as leg_lift_support_pose's own v8.3 fix,
+        # applied here to orientation instead of joint pose). Paired with
+        # leg_lift_base_height's own v8.4 always-on fix (see that function's
+        # docstring) -- height and orientation are now BOTH actively anchored
+        # at idle, not just one of the two.
+        self.rewards.flat_orientation_l2.weight = -10.0
         self.rewards.feet_slide.weight = -0.5
 
         # -- the lift objective itself (v7 mechanism, v8 per-env curriculum target)
