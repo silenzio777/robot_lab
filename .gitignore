@@ -27,6 +27,8 @@
 **/wandb/*
 **/.neptune/*
 docker/artifacts/
+docker/cloud/b2_overlay/
+cloud_results/
 *.tmp
 
 # Isaac-Sim packman
