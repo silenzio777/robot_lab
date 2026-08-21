@@ -168,6 +168,23 @@ class LegLiftCommand(CommandTerm):
     2-slot (lin_vel_x, lin_vel_y) command, magnitude doubles as `.signal` (0
     idle, ramps to 1 held, ramps back down) -- unchanged from v8.
 
+    v9.4 FIX (2026-08-21, base's design after the gravity-feedforward action
+    offset failed validation -- see leg_lift_env_cfg.py's own history and
+    train_research/TRAINING_STATE.md's 17:3x-18:2x entries): widened to a
+    3rd, always-zero slot ([lin_vel_x, lin_vel_y, 0.0], matching stock
+    walk's [vx, vy, wz] width) purely so this task's actor/critic
+    observation widths match unitree_b2_rough's own (45/235, verified
+    against unitree_b2_rough/2026-08-01_13-48-23/model_5000.pt's own
+    state_dict shapes before this run) -- enabling a cross-task warm-start
+    resume from that checkpoint. The root problem was never the reward
+    weights: walk already holds default_joint_pos rock-solid at cmd=0 under
+    the exact same kp=160 gravity load leg_lift does, it just never gets a
+    chance to LEARN that precompensation from scratch because leg_lift's
+    idle state has "do nothing" as an unusually strong local optimum (walk
+    is always moving, so it never falls into that optimum in the first
+    place). Resuming from a network that already solved this exact
+    sub-problem sidesteps it entirely -- no offset, no reward escalation.
+
     Owns the Rudin-style per-env height curriculum (`height_target`,
     reworked for v9 into a DURATION-based success criterion --
     `_hold_intol_time`/`_hold_entered` -- instead of v8's whole-hold boolean
@@ -178,7 +195,10 @@ class LegLiftCommand(CommandTerm):
     def __init__(self, cfg: "LegLiftCommandCfg", env) -> None:
         super().__init__(cfg, env)
         n = self.num_envs
-        self._command = torch.zeros(n, 2, device=self.device)
+        # 3rd column (wz-shaped slot) stays exactly 0.0 forever -- _update_command
+        # below only ever writes columns 0:2, matching walk's [vx, vy, wz=0] shape
+        # for the warm-start resume (see class docstring's v9.4 note).
+        self._command = torch.zeros(n, 3, device=self.device)
         self.signal = torch.zeros(n, device=self.device)
         self.direction = torch.zeros(n, 2, device=self.device)
         self.idle_duration = torch.zeros(n, device=self.device)
@@ -502,9 +522,37 @@ class UnitreeB2LegLiftRoughEnvCfg(UnitreeB2RoughEnvCfg):
 
         # -- the lift objective: exactly three custom terms, handstand-
         # proportioned weights (10/5/5) -- see each function's own docstring.
+        #
+        # STAGE 0 (2026-08-21, base's design after v9.4's warm-start it+100
+        # gate failed and BOTH follow-up hypotheses -- mass mismatch,
+        # actuator sim2sim -- were checked and refuted, see TRAINING_STATE.md
+        # 18:25-19:10 entries): all three weights forced to 0 here (which
+        # `disable_zero_weight_rewards()` below then drops from the reward
+        # manager entirely -- these terms don't run at all this stage, no
+        # observation-width impact, only RewardsCfg is touched).
+        #
+        # Root reframing: nobody ever confirmed walk's RL policy could
+        # genuinely STAND at cmd=0 in the first place. `rel_standing_envs=
+        # 0.02` in velocity_env_cfg.py's own UniformVelocityCommandCfg
+        # (verified directly, not from memory) means walk trains on a
+        # zero-command episode only ~2% of the time -- and on the real
+        # robot, standing between maneuvers is a separate classical-PD
+        # FixStand state, never this RL policy's job at all. The bench's
+        # -16deg idle-pitch measurement on a COMPLETELY untouched walk
+        # checkpoint (Test W, this session) is therefore likely the
+        # policy's genuine, never-fixed cmd=0 equilibrium, not a bench/mass/
+        # actuator artifact (both of those were independently ruled out).
+        # leg_lift is the first task in this lab where genuine idle standing
+        # is actually load-bearing -- Stage 0 asks it to learn JUST that,
+        # nothing else, warm-started from walk's general locomotion skill
+        # but with the novel lift objective entirely absent so there's no
+        # large new gradient competing with re-learning to stand still.
+        # Gate: bench-idle pitch <3 deg (base's threshold). Stage 1 (already
+        # designed, not yet run) ramps these three weights back 0->10/5/5
+        # from whatever checkpoint clears this gate.
         self.rewards.leg_lift_foot_height = RewTerm(
             func=leg_lift_foot_height,
-            weight=10.0,
+            weight=0.0,
             params={
                 "command_name": "base_velocity",
                 "asset_cfg": SceneEntityCfg("robot", body_names=FOOT_BODY_NAMES, preserve_order=True),
@@ -512,7 +560,7 @@ class UnitreeB2LegLiftRoughEnvCfg(UnitreeB2RoughEnvCfg):
         )
         self.rewards.leg_lift_foot_on_air = RewTerm(
             func=leg_lift_foot_on_air,
-            weight=5.0,
+            weight=0.0,
             params={
                 "command_name": "base_velocity",
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=FOOT_BODY_NAMES, preserve_order=True),
@@ -520,7 +568,7 @@ class UnitreeB2LegLiftRoughEnvCfg(UnitreeB2RoughEnvCfg):
         )
         self.rewards.leg_lift_foot_air_time = RewTerm(
             func=leg_lift_foot_air_time,
-            weight=5.0,
+            weight=0.0,
             params={
                 "command_name": "base_velocity",
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=FOOT_BODY_NAMES, preserve_order=True),
