@@ -290,7 +290,41 @@ JUMP_LANDING_STILL_SIGMA = 0.5
 # the exact same purpose ("did a real jump happen, not just ground noise") --
 # a shared named constant keeps the two uses from silently drifting apart if
 # either is ever retuned.
-MIN_FLIGHT_BASE_HEIGHT = 0.55
+#
+# 0.55 -> 0.54 (2026-08-21, v7 А overnight monitoring, resumed from v5's
+# model_44998.pt): 6 checkpoint-spaced peak-height measurements
+# (scratchpad/check_jump_peak.py, precise MuJoCo bench readout, not eyeballed)
+# over ~1h of training at it49400-55000 came back 0.5458/0.5447/0.5440/0.5430/
+# 0.5430 -- a confirmed, stable ceiling just under the gate, not noise (reward
+# and vertical_launch/direction_velocity stayed healthy/growing the whole
+# time, only the peak-height metric specifically stalled). Because had_flight
+# (and everything downstream: jump_flight, jump_task_max_height,
+# jump_task_jumping_bonus, all the jump_landing_* terms) NEVER latches until
+# a cycle clears this bar even once, the policy had zero gradient toward the
+# real 0.85m target (JUMP_TASK_MAX_HEIGHT_TARGET) despite being ~1.3cm above
+# standing height (0.53) already -- a classic RL bootstrap dead zone, not a
+# capability ceiling.
+#
+# CORRECTION, same session, ~30min later: 0.54 didn't unblock had_flight even
+# though the resumed run's own peak-height readout (0.5432m) technically
+# cleared it -- check_jump_peak.py measured the ABSOLUTE max base_z over the
+# whole window regardless of foot contact, but had_flight requires base_z>
+# threshold AND all_airborne SIMULTANEOUSLY (see _update_command below). Wrote
+# scratchpad/check_jump_peak3.py to log base_z specifically during genuinely-
+# all-airborne instants: on the same it56000 checkpoint, that narrower true
+# max was only 0.5397m -- the ballistic peak happens slightly AFTER the rear
+# feet already start re-contacting for landing, so "highest point reached" and
+# "highest point while still fully airborne" are different numbers, and only
+# the second one is what this gate actually checks. 0.54 -> 0.535 (this
+# comment's edit): ~3mm below the measured true airborne-max (0.5397) as a
+# safety margin, not 1cm above the WRONG number 0.5430 was read as. Still
+# comfortably above standing height (0.53, ~5mm) and the squat-pogo exploit
+# floor (~0.2m) -- same anti-reopening reasoning as the original 0.54 pick,
+# just recalibrated to the metric the code actually gates on.
+#
+# Resumed training from the last checkpoint before EITHER edit (model_55000.pt
+# from run 2026-08-21_03-08-57), not restarted from scratch either time.
+MIN_FLIGHT_BASE_HEIGHT = 0.535
 
 # Named 2026-08-19 (v7, cycle_peak_height's own init-clamp fix) -- was already
 # a bare 0.53 literal at jump_landing_height_stance/jump_idle_height's own
