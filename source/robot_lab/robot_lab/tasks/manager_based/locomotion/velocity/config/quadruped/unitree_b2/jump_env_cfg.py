@@ -1039,9 +1039,24 @@ class UnitreeB2JumpRoughEnvCfg(UnitreeB2RoughEnvCfg):
                 "min_base_height": MIN_FLIGHT_BASE_HEIGHT,
             },
         )
+        # 8.0 -> 11.0 (2026-08-22, owner's direct decision after the vertical_launch
+        # 10->14 fix: peak height gained margin (0.5435->0.5493m, 6/6 dense sweep,
+        # see TRAINING_STATE.md ~14:30) but forward distance dropped -45% (0.225m
+        # ->0.124m) as a measured, consistent side-effect -- raising vertical
+        # impulse without touching horizontal terms shifted the economy toward
+        # height at distance's expense. Single-variable fix, same discipline as
+        # the vertical_launch change: this term is gated on min_base_height
+        # (MIN_FLIGHT_BASE_HEIGHT, the same bar just confirmed reliably cleared)
+        # so pushing it can't undermine the height fix -- it only pays once the
+        # jump has already cleared that bar, rewarding MORE horizontal velocity
+        # during an already-qualifying flight, not a competing objective.
+        # +37.5% (not a multiplier), same "one deliberate step" precedent as the
+        # vertical_launch +40%. Resume from jump_v7c_final_65499 (the checkpoint
+        # this regression was measured on), --no_resume_optimizer (new weight
+        # scale), short budget to see the trend before committing more.
         self.rewards.jump_flight_distance = RewTerm(
             func=jump_flight_distance,
-            weight=8.0,
+            weight=11.0,
             params={
                 "command_name": "base_velocity",
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_calf"),
