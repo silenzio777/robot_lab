@@ -123,6 +123,27 @@ class JumpPulseCommand(CommandTerm):
         self.contacts = torch.zeros(n, 4, dtype=torch.bool, device=self.device)
         self.contact_diff = torch.zeros(n, device=self.device)
 
+        # v7d postmortem fix (2026-08-22, base's diagnosis, confirmed by code +
+        # a direct yaw-drift-vs-lateral-drift correlation measurement --
+        # TRAINING_STATE.md same date): jump_direction_velocity/
+        # jump_flight_distance both used to recompute yaw from the LIVE
+        # root_quat_w every single step and rotate world velocity into that
+        # ever-changing frame -- "forward" for those terms meant "wherever the
+        # torso currently points", not "wherever it pointed at launch". A
+        # policy that yaws mid-flight can make world-frame lateral drift score
+        # as honest "vel_along" for free, without any real progress toward the
+        # originally commanded direction -- exactly the exploit that made
+        # v7d's lateral drift grow 4x (0.06->0.23m) in lockstep with growing
+        # yaw drift (9->22 deg) once jump_flight_distance's weight rose enough
+        # to make the exploit worth it. Fix: capture yaw ONCE, the instant the
+        # launch phase begins (phase>=CROUCH_PHASE_END), and hold it fixed for
+        # the rest of that cycle -- same "resolve once per cycle, not every
+        # step" idiom this class already uses for `direction` in
+        # _resample_command. Both reward functions now read `term.launch_yaw`
+        # instead of recomputing it.
+        self.launch_yaw = torch.zeros(n, device=self.device)
+        self._launch_yaw_captured = torch.zeros(n, dtype=torch.bool, device=self.device)
+
     @property
     def command(self) -> torch.Tensor:
         return self._command
@@ -162,6 +183,8 @@ class JumpPulseCommand(CommandTerm):
         self.cycle_peak_height[env_ids] = torch.clamp(
             self.robot.data.root_pos_w[env_ids, 2], max=STANDING_TARGET_HEIGHT
         )
+        # v7d fix: fresh cycle, launch_yaw not captured yet this time around.
+        self._launch_yaw_captured[env_ids] = False
 
     def _update_command(self):
         elapsed = self.cycle_duration - self.time_left
@@ -200,6 +223,16 @@ class JumpPulseCommand(CommandTerm):
         active = self.window_active.unsqueeze(-1).float()
         self._command[:, 0:2] = self.direction * active
         self._command[:, 2] = self.phase
+
+        # v7d fix: capture yaw ONCE, the first step this cycle where the
+        # launch phase has begun -- see launch_yaw's own __init__ comment.
+        entering_launch = self.window_active & (self.phase >= CROUCH_PHASE_END) & ~self._launch_yaw_captured
+        if torch.any(entering_launch):
+            q = self.robot.data.root_quat_w
+            w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+            yaw_now = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+            self.launch_yaw = torch.where(entering_launch, yaw_now, self.launch_yaw)
+            self._launch_yaw_captured = self._launch_yaw_captured | entering_launch
 
 
 @configclass
@@ -400,12 +433,13 @@ def jump_flight_distance(
     asset = env.scene["robot"]
     # Same min_base_height gate as jump_flight -- see its docstring (anti-squat-pogo).
     high = (asset.data.root_pos_w[:, 2] > min_base_height).float()
-    # Direction is commanded in the robot's yaw frame -- rotate the world-frame base
-    # velocity into it via the root quat's yaw (cheap 2D rotation).
-    quat = asset.data.root_quat_w
-    w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
-    yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
-    cos_yaw, sin_yaw = torch.cos(yaw), torch.sin(yaw)
+    # v7d fix (2026-08-22): rotate into the YAW FIXED AT LAUNCH (term.launch_yaw),
+    # not the live root_quat_w recomputed every step -- see launch_yaw's own
+    # __init__ comment. The old "cheap 2D rotation via the CURRENT yaw" let a
+    # policy that yaws mid-flight collect world-frame lateral drift as free
+    # "vel_along" credit -- confirmed by a direct yaw-drift-vs-lateral-drift
+    # correlation measurement (TRAINING_STATE.md 2026-08-22, v7d postmortem).
+    cos_yaw, sin_yaw = torch.cos(term.launch_yaw), torch.sin(term.launch_yaw)
     vel_w = asset.data.root_lin_vel_w[:, 0:2]
     vel_local_x = vel_w[:, 0] * cos_yaw + vel_w[:, 1] * sin_yaw
     vel_local_y = -vel_w[:, 0] * sin_yaw + vel_w[:, 1] * cos_yaw
@@ -767,10 +801,11 @@ def jump_direction_velocity(env, command_name: str, max_vel: float) -> torch.Ten
     post-crouch so horizontal drift during the fold doesn't score."""
     term = env.command_manager.get_term(command_name)
     asset = env.scene["robot"]
-    q = asset.data.root_quat_w
-    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-    yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
-    cos_yaw, sin_yaw = torch.cos(yaw), torch.sin(yaw)
+    # v7d fix (2026-08-22): use the YAW FIXED AT LAUNCH (term.launch_yaw), not
+    # the live root_quat_w recomputed every step -- see launch_yaw's own
+    # __init__ comment for the yaw-drift exploit this closes. Captured on the
+    # exact same step `in_launch` below first goes true, so it's never stale.
+    cos_yaw, sin_yaw = torch.cos(term.launch_yaw), torch.sin(term.launch_yaw)
     vel_w = asset.data.root_lin_vel_w[:, 0:2]
     vel_local_x = vel_w[:, 0] * cos_yaw + vel_w[:, 1] * sin_yaw
     vel_local_y = -vel_w[:, 0] * sin_yaw + vel_w[:, 1] * cos_yaw
