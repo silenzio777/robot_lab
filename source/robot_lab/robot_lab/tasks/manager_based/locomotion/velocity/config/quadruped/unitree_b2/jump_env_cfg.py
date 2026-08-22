@@ -264,7 +264,24 @@ class JumpPulseCommand(CommandTerm):
         self.had_flight = self.had_flight | (
             self.window_active & all_airborne & (self.min_foot_clearance > FLIGHT_CLEARANCE_EPS)
         )
-        self.cycle_peak_height = torch.max(self.cycle_peak_height, self.min_foot_clearance)
+        # 2026-08-23 night, base's review (BUG-1): must be gated to window_active,
+        # NOT unconditional every step. rough_env_cfg.py's randomize_reset_base
+        # event spawns the robot up to +0.2m above the ground at EPISODE reset --
+        # during the idle slice right after that (window_active is False there,
+        # nowhere near a real jump attempt), the robot is still settling/falling
+        # from spawn, briefly clearing all 4 feet with real clearance. Unconditional
+        # tracking let that spawn-fall get recorded as this cycle's "peak", handing
+        # jump_task_max_height a large free payout for a later 4cm micro-hop that
+        # had nothing to do with the spawn event -- and worse, a policy terminating
+        # itself (illegal_contact) could farm repeated spawn-falls for free credit.
+        # window_active alone is sufficient (excludes idle entirely, where the old
+        # code's own spawn-fall bug lived) -- a real flight peak only ever happens
+        # inside the window by construction.
+        self.cycle_peak_height = torch.where(
+            self.window_active,
+            torch.max(self.cycle_peak_height, self.min_foot_clearance),
+            self.cycle_peak_height,
+        )
 
         landing_timer = elapsed >= window_end
         self.landing_active = landing_timer & self.had_flight
@@ -489,26 +506,18 @@ JUMP_TASK_MAX_HEIGHT_TARGET = 0.20
 # ladder's own 10-60cm range.
 JUMP_TASK_MAX_HEIGHT_SIGMA = 0.02
 
-# FK-calibrated tuck target (2026-08-23, base's design -- see
-# jump_airborne_leg_tuck's own docstring for the reward mechanism this
-# feeds). Direct MuJoCo FK sweep (not guessed, same discipline as
-# leg_lift_env_cfg.py's THIGH_FOLD_TARGET / rear_stand_env_cfg.py's
-# REAR_LEG_EXTENSION_TARGET): with thigh held at its own standing default
-# (0.8 -- this tuck needs NO thigh motion at all, only calf), sweeping calf
-# from -1.5 (standing) toward its own flex limit (-2.82) found calf=-2.55
-# raises the foot 0.329m above standing (clears the owner's implied
-# per-leg contribution to 0.30m+ with margin), calf-limit margin 0.27rad
-# (~11% of the joint's own [-2.82,-0.43] range) -- comparable safety margin
-# to REAR_LEG_EXTENSION_TARGET's own precedent. Hip untouched (identity/0).
-CALF_TUCK_TARGET = -2.55
-# sum-of-squared-error scale for jump_airborne_leg_tuck's exp kernel, summed
-# over 8 joints (thigh+calf x4 legs). At the standing pose (before any tuck
-# progress at all), calf alone contributes (CALF_TUCK_TARGET - (-1.5))^2 =
-# 1.1025 per leg -> 4.41 summed over 4 legs (thigh contributes ~0 since its
-# own target IS the standing default) -- exp(-4.41/2.0) = 0.110, a live
-# starting gradient, not a vanishing one (same "verify sigma isn't dead at
-# the starting point" discipline as JUMP_TASK_MAX_HEIGHT_SIGMA above).
-TUCK_SIGMA = 2.0
+# CALF_TUCK_TARGET / TUCK_SIGMA / jump_airborne_leg_tuck -- ADDED then
+# REMOVED same night (2026-08-23), after the owner shared official Unitree
+# B2 jump reference footage (train_research/ROBOTS/B2/JUMP_REFERENCE.md):
+# the vendor video shows legs progressively EXTENDING and reaching forward
+# through flight, not folding/tucking toward the body -- the FK-calibrated
+# fold-toward-body pose this constant targeted was the wrong shape entirely.
+# Rather than invent a SECOND choreographed pose target (a "reach forward"
+# anchor) to match the corrected reference, base's design reuses the
+# ALREADY-CALIBRATED jump_landing_pose anchor for the descending half of
+# flight instead (see that function's own 2026-08-23 comment) -- simpler,
+# non-gameable (gated on ballistic v_z sign, not a policy-chosen pose), and
+# avoids repeating the same prescribe-a-pose mistake with different numbers.
 
 # FK offset from each calf BODY's own frame origin (which sits at the KNEE,
 # not the foot -- b2.xml has no separate foot bodies) to the actual foot
@@ -523,7 +532,20 @@ TUCK_SIGMA = 2.0
 # here via a fixed local-frame constant (a torch tensor + quat_apply) since
 # training-time reward code operates on IsaacLab's body-level state, not a
 # raw MuJoCo model to enumerate geoms from directly.
-FOOT_GEOM_LOCAL_OFFSET = (0.0, 0.0, -0.35)
+#
+# -0.35 -> -0.382 (2026-08-23, base's review caught a second-order version
+# of the SAME manipulable-anchor class): the foot collision geom is a
+# SPHERE, radius 0.032m (confirmed by direct MuJoCo model inspection,
+# geom_size[0]=0.032) -- -0.35 alone lands on the sphere's CENTER, not
+# where it touches the ground. At standing pose this read ~0.059m instead
+# of ~0m -- FLIGHT_CLEARANCE_EPS (0.03) and JUMP_TASK_MAX_HEIGHT_TARGET's
+# own zero-point would have been silently offset by the sphere radius,
+# reading "genuine liftoff" a full 3cm before the foot actually left the
+# ground. -0.35 - 0.032 = -0.382 reaches the sphere's BOTTOM (the true
+# ground-contact point) instead -- verified: standing clearance now reads
+# 0.027m (residual is normal contact-solver penetration/settle, not a
+# calibration error), no longer conflated with the sphere's own radius.
+FOOT_GEOM_LOCAL_OFFSET = (0.0, 0.0, -0.382)
 
 
 def _feet_airborne(env, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
@@ -607,9 +629,10 @@ def jump_vertical_launch(env, command_name: str) -> torch.Tensor:
     min-over-4-hips collapses to ~0 in that case, killing the credit at
     its SOURCE. A genuine level push raises all 4 hips together and pays
     in full -- this is the "толкайся ЗАДНИМИ" lever the owner asked for,
-    expressed as a reward gradient rather than a prescribed pose (see
-    jump_airborne_leg_tuck's own docstring for why pose-prescription was
-    rejected here in favor of an outcome-based fix)."""
+    expressed as a reward gradient rather than a prescribed pose (the
+    launch phase itself gets no choreographed pose target anywhere in
+    this file's 2026-08-23 redesign -- see jump_landing_pose's own comment
+    for why the descending-flight pose anchor exists instead)."""
     term = env.command_manager.get_term(command_name)
     asset = env.scene["robot"]
     # Launch phase only -- paying v_z during the crouch slice would reward skipping
@@ -701,7 +724,18 @@ def jump_launch_attitude(env, command_name: str) -> torch.Tensor:
     g_xy = asset.data.projected_gravity_b[:, 0:2]
     tilt = torch.sum(torch.square(g_xy), dim=1)
     all_airborne = ~term.contacts.any(dim=1)
-    in_free = term.window_active & (all_airborne | term.landing_active)
+    # 2026-08-23 night, base's review (BUG-2): `landing_active` is BY
+    # DEFINITION `elapsed >= window_end & had_flight` while `window_active`
+    # requires `elapsed < window_end` -- the two are mutually exclusive, so
+    # the ORIGINAL `window_active & (all_airborne | landing_active)` made
+    # `window_active & landing_active` always False, silently killing the
+    # landing half of this term entirely (attitude was NEVER actually priced
+    # on landing, despite the docstring's own claim). Parenthesization fixed:
+    # window_active gates ONLY the airborne branch (a real flight moment is
+    # always inside the window by construction); landing_active already
+    # carries its own sufficient gating (implies past window_end AND a real
+    # flight happened), doesn't need window_active additionally.
+    in_free = (term.window_active & all_airborne) | term.landing_active
     return tilt * in_free.float()
 
 
@@ -744,62 +778,6 @@ def jump_motor_speed_violation(env, asset_cfg=None) -> torch.Tensor:
     leg_vel = asset.data.joint_vel[:, leg_ids]
     excess = (leg_vel.abs() / limits - 1.0).clamp(min=0.0, max=2.0)
     return torch.sum(torch.square(excess), dim=1)
-
-
-def jump_airborne_leg_tuck(env, command_name: str, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
-    """POSITIVE exp-anchor to a TUCKED pose (thigh unchanged at its own
-    standing default, calf pulled to CALF_TUCK_TARGET -- see that constant's
-    own FK-derivation comment) on all 4 legs' thigh+calf joints, while
-    genuinely airborne (post-crouch).
-
-    2026-08-23 night (base+train redesign): REPLACES jump_airborne_leg_
-    stillness (2026-08-09, a velocity PENALTY -- "жестко штрафовать
-    дрыганье ногами") entirely, not just retuned. Root cause found by the
-    owner's own physics reasoning (TRAINING_STATE.md same date): the owner's
-    real target (foot clearance 0.50-0.60m) is likely UNREACHABLE by pure
-    ballistic body height alone for a ~74.5kg quadruped (B2 vs. e.g. a 12kg
-    reference robot's own 0.90m target scales very unfavorably by mass) --
-    the physically plausible route is a modest body-height gain PLUS an
-    in-flight leg TUCK (real dogs jump this way; Atanassov's own reference
-    work does too). But jump_airborne_leg_stillness's velocity penalty
-    FORBADE exactly the fast joint motion a tuck requires, right after
-    liftoff -- a real structural block on the only physically available
-    route to real clearance, discovered by term-attribution on it67000
-    (a what-if calc: an 8-joint 50%-rated-speed tuck would have cost
-    ~-6.0/step under the old term, ~5-6x more than the rearing checkpoint's
-    OWN passive near-stillness paid in the same rollout).
-
-    A pose anchor (not a velocity penalty) lets the policy move AS FAST AS
-    IT WANTS to reach the tuck -- speed itself is never priced, only
-    distance from the target pose is, so a fast tuck and a slow tuck cost
-    the same once reached, and unlike the deleted term, the pose target is
-    directional: heading TOWARD tuck is rewarded, flailing away from it is
-    not free the way "not moving" used to be. Also absorbs
-    jump_airborne_front_leg_pose's own job (that term is REMOVED, not kept
-    alongside this one -- two competing pose anchors in flight would
-    conflict; a single unified tuck target for all 4 legs is simpler and
-    covers the front-leg-specific bug that term existed for too, since a
-    front leg drifting toward ITS OWN passive fold now also drifts away
-    from ITS OWN tuck target and pays for it).
-
-    Sum-of-squared-error over all 8 joints combined into ONE exp kernel
-    (not 4 independent per-leg kernels) -- deliberately couples all 4 legs
-    together: a policy that tucks 3 legs cleanly but leaves 1 extended
-    still pays for the one holdout, pushing toward a UNIFORM tuck rather
-    than a partial one. See TUCK_SIGMA's own comment for why this kernel
-    starts with a live (not vanishing) gradient at the standing pose."""
-    term = env.command_manager.get_term(command_name)
-    asset = env.scene["robot"]
-    joint_names = asset.joint_names
-    ids = [i for i, n in enumerate(joint_names) if n.endswith(("_thigh_joint", "_calf_joint"))]
-    target = asset.data.default_joint_pos[:, ids].clone()
-    for i, jid in enumerate(ids):
-        if joint_names[jid].endswith("_calf_joint"):
-            target[:, i] = CALF_TUCK_TARGET
-    err = torch.sum(torch.square(asset.data.joint_pos[:, ids] - target), dim=1)
-    airborne = _feet_airborne(env, sensor_cfg)
-    post_crouch = term.window_active & (term.phase >= CROUCH_PHASE_END)
-    return torch.exp(-err / TUCK_SIGMA) * (airborne & post_crouch).float()
 
 
 def jump_landing_impact(env, command_name: str, sensor_cfg: SceneEntityCfg, soft_threshold: float) -> torch.Tensor:
@@ -1030,13 +1008,38 @@ def jump_landing_pose(env, command_name: str, asset_cfg=None) -> torch.Tensor:
     during the landing slice -- Atanassov's own `default_pose`. Sharp-ish
     sigma (this file's shared TRACKING_SIGMA scale would be too soft for a
     "snap back to stance" signal) -- first guess, not empirically calibrated,
-    expect revision same as every other sigma in this codebase's history."""
+    expect revision same as every other sigma in this codebase's history.
+
+    2026-08-23 night (base's design, vendor-reference-driven -- see
+    train_research/ROBOTS/B2/JUMP_REFERENCE.md, official Unitree B2 jump
+    footage the owner shared): gate window WIDENED from `landing_active`
+    alone to `landing_active | (airborne & descending)`. The reference
+    video shows the legs progressively EXTENDING and reaching forward
+    through flight, converging on something close to this SAME default-
+    stance pose right before touchdown (frame 4: "ещё сильнее выпрямлены,
+    подала их вперёд" -- reaching for the landing). An earlier design
+    attempted a separate FK-calibrated "tuck" pose anchor for the rising
+    half of flight (jump_airborne_leg_tuck, since REMOVED) -- the vendor
+    footage showed that was the wrong shape entirely (extension/reach, not
+    a fold), and inventing a SECOND choreographed "reach" pose target would
+    have repeated the same prescribe-a-pose mistake with a different pose,
+    not fixed it. Reusing this ALREADY-CALIBRATED anchor for the descent
+    half of flight is simpler and non-gameable: `descending` (root v_z < 0)
+    is decided by gravity once airborne, not something the policy can fake
+    -- same "outcome-based, not choreographed" principle as the vertical_
+    launch fix above. The RISING half of flight gets no pose anchor at all
+    (legs are already extended from the push-off itself, physically nothing
+    to anchor there per the reference -- see jump_env_cfg.py's design
+    notes for the full reasoning)."""
     term = env.command_manager.get_term(command_name)
     asset = env.scene[asset_cfg.name if asset_cfg is not None else "robot"]
     joint_names = asset.joint_names
     leg_ids = [i for i, n in enumerate(joint_names) if n.endswith(("_hip_joint", "_thigh_joint", "_calf_joint"))]
     err = torch.sum(torch.square(asset.data.joint_pos[:, leg_ids] - asset.data.default_joint_pos[:, leg_ids]), dim=1)
-    return torch.exp(-err / JUMP_LANDING_POSE_SIGMA) * term.landing_active.float()
+    all_airborne = ~term.contacts.any(dim=1)
+    descending = asset.data.root_lin_vel_w[:, 2] < 0.0
+    gate = term.landing_active | (all_airborne & descending)
+    return torch.exp(-err / JUMP_LANDING_POSE_SIGMA) * gate.float()
 
 
 def jump_landing_height_stance(env, command_name: str, target_height: float) -> torch.Tensor:
@@ -1300,27 +1303,20 @@ class UnitreeB2JumpRoughEnvCfg(UnitreeB2RoughEnvCfg):
         self.rewards.jump_motor_speed_violation = RewTerm(
             func=jump_motor_speed_violation, weight=-2.0, params={"asset_cfg": SceneEntityCfg("robot")}
         )
-        # 2026-08-09 (user, bench: "дрыганье ногами в воздухе во время самого
-        # прыжка") -> DELETED 2026-08-23 night (base+train redesign): this
-        # velocity PENALTY was found (term-attribution on it67000, TRAINING_
-        # STATE.md same date) to structurally forbid the in-flight leg TUCK
-        # that's the physically plausible route to the owner's real target
-        # (foot clearance 0.50-0.60m -- see jump_airborne_leg_tuck's own
-        # docstring for the full reasoning). Replaced by a POSITIVE pose
-        # anchor instead of a speed penalty -- see that function.
-        #
-        # jump_airborne_front_leg_pose (2026-08-14) also REMOVED here, not
-        # kept alongside -- its job (front leg shouldn't passively fold) is
-        # absorbed by the SAME unified tuck anchor below; two competing pose
-        # anchors in flight would conflict.
-        self.rewards.jump_airborne_leg_tuck = RewTerm(
-            func=jump_airborne_leg_tuck,
-            weight=4.0,
-            params={
-                "command_name": "base_velocity",
-                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_calf"),
-            },
-        )
+        # jump_airborne_leg_stillness (2026-08-09, velocity PENALTY) and
+        # jump_airborne_front_leg_pose (2026-08-14, FRONT-leg-only pose
+        # anchor) both DELETED 2026-08-23 night (base+train redesign,
+        # rearing-exploit fix). An intermediate design (jump_airborne_leg_
+        # tuck, a fold-toward-body pose anchor) was tried and ALSO removed
+        # the same night after the owner shared official Unitree B2 jump
+        # reference footage (train_research/ROBOTS/B2/JUMP_REFERENCE.md)
+        # showing the real jump EXTENDS the legs through flight, not folds
+        # them -- see jump_landing_pose's own 2026-08-23 comment for the
+        # design that replaced it (widened that already-calibrated anchor's
+        # gate to cover the descending half of flight too, instead of
+        # inventing a new "reach forward" pose target). The rising half of
+        # flight gets NO pose anchor at all: per the reference, legs are
+        # already extended right out of the push-off, nothing to anchor.
         # Weight history: 1.0 in run 2026-08-04_22-14-17 -- too weak, the exact
         # stand-still optimum returned (vertical_launch flatlined at ~0.02-0.04,
         # noise_std collapsed 1.18->0.67): a vigorous push costs more in action_rate/
