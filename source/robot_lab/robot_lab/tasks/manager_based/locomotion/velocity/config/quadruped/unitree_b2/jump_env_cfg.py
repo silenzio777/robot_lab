@@ -1089,9 +1089,23 @@ class UnitreeB2JumpRoughEnvCfg(UnitreeB2RoughEnvCfg):
         # vertical_launch +40%. Resume from jump_v7c_final_65499 (the checkpoint
         # this regression was measured on), --no_resume_optimizer (new weight
         # scale), short budget to see the trend before committing more.
+        #
+        # 11.0 -> 8.0 REVERTED (2026-08-22 night, v7d exploit-fix verification
+        # run, base+train, see train_research/TRAINING_STATE.md same date):
+        # 5-checkpoint dense sweep on the it65499->67498 run (SAME resume
+        # source, WITH the launch_yaw exploit fix from commit 9e90304 applied)
+        # showed forward distance never recovered at all across the whole
+        # 2000-iteration budget (0.122/0.093/0.092/0.078/0.103m -- still far
+        # below v7c's own 0.225m baseline) -- the weight bump itself doesn't
+        # achieve its goal, exploit or not. Reverting to v7c's own value;
+        # recovering distance needs a different approach (not just this one
+        # weight), left as an open problem for a future session, not tonight.
+        # The exploit fix itself (launch_yaw) stays -- structurally correct
+        # regardless of this experiment's outcome. v7c + the fix is now the
+        # stable baseline going forward.
         self.rewards.jump_flight_distance = RewTerm(
             func=jump_flight_distance,
-            weight=11.0,
+            weight=8.0,
             params={
                 "command_name": "base_velocity",
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_calf"),
