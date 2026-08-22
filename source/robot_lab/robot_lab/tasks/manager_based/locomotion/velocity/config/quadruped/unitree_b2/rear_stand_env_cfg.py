@@ -440,16 +440,34 @@ def rear_stand_height(env, asset_cfg=None) -> torch.Tensor:
 # rear knees still visibly more bent than the Go2 reference. This constant is
 # the calf-joint target that closes that hole -- see
 # rear_stand_rear_leg_extension's own docstring for the full mechanism.
-# Picked from the calf joint's own physical limits (b2.urdf: RL/RR_calf_joint
-# range [-2.82, -0.43] rad, default quadruped pose -1.5) -- -0.43 is the
-# mechanical near-straight limit, same class of singularity as the 0.70m
-# hip-to-foot ceiling already found for STAND_HEIGHT_TARGET. -0.65 leaves
-# ~0.22 rad margin from that limit, same "leave headroom from the
-# singularity" logic as STAND_HEIGHT_TARGET's own 0.62m (89% of 0.70m).
-# FIRST GUESS, not empirically calibrated against what training actually
-# produces -- expect this may need a postmortem-driven revision same as
-# STAND_HEIGHT_TARGET/HEIGHT_TRACKING_SIGMA both needed tonight.
-REAR_LEG_EXTENSION_TARGET = -0.65
+# -0.65 -> -1.0 (2026-08-22, owner's Go2-video reference: "нижние [rear] ноги
+# ПОЛУСОГНУТЫ, упирается прямо нижними конечностями в пол" -- semi-bent, not
+# near-straight). The original -0.65 was picked from the calf joint's angle
+# RANGE alone ([-2.82,-0.43], "leaves ~0.22 rad margin") without checking what
+# that angle actually does geometrically -- verified 2026-08-22 with a direct
+# MuJoCo FK sweep (set RR_thigh/RR_calf qpos, read the foot contact geom's
+# world position, not the calf BODY's -- the calf body's own origin sits AT
+# the knee, angle-invariant, confirmed same "calf-independent" quirk already
+# known from leg_lift's LIFT_HEIGHT_INIT FK sweep; the calf JOINT rotates a
+# further foot geom 0.35m past it, which the old calf-body-based checks in
+# this file never accounted for): hip-to-foot reach depends ONLY on the calf
+# angle (thigh angle changes direction, not magnitude, of the reach -- an
+# overall rotation about the hip). At -0.65, reach=0.674m -- 97% of the
+# 0.694m fully-straight ceiling, i.e. barely bent at all despite "leaving
+# margin" in raw joint-angle terms (the angle-to-reach relationship is highly
+# nonlinear near the singularity, not proportional to the angle range).
+# WORSE: -0.65's reach (0.674m) sits ABOVE STAND_HEIGHT_TARGET (0.62m) --
+# the two anchors were fighting each other (this term pulled the leg further
+# open than the height target itself needed), not reinforcing.
+# -1.0 gives reach=0.626m (matches STAND_HEIGHT_TARGET directly, same FK
+# sweep) at margin=0.57 rad from the -0.43 limit (26% of the full range,
+# ~2.6x -0.65's margin) -- genuinely semi-bent, consistent with the height
+# target instead of exceeding it, and further from the mechanical
+# singularity. FK sweep script not committed (one-off scratchpad check),
+# reproducible: sweep RR_thigh/RR_calf qpos in the b2_navigate MuJoCo task,
+# read geom 63 (the calf body's foot-contact sphere, local pos ~[0,0,-0.35])
+# world position minus RR_hip body world position.
+REAR_LEG_EXTENSION_TARGET = -1.0
 
 
 def rear_stand_rear_leg_extension(env, asset_cfg=None) -> torch.Tensor:
