@@ -67,7 +67,9 @@ driver, kept in sync by hand) for the raw-stick side of this.
 
 import torch
 
+import robot_lab.tasks.manager_based.locomotion.velocity.mdp as mdp
 from isaaclab.managers import CommandTerm, CommandTermCfg
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
@@ -454,6 +456,53 @@ def leg_lift_foot_air_time(env, command_name: str, sensor_cfg: SceneEntityCfg, t
     return (reward_all * mask).sum(dim=1)
 
 
+def leg_lift_support_contact(env, command_name: str, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
+    """v9.5 FIX (2026-08-22, base's diagnosis after Stage 1's final gate:
+    forward PASSED 3/4 directions but FAILED forward specifically, 2 checks
+    in a row it25000/it30199, not noise -- see TRAINING_STATE.md). The v9
+    redesign dropped `leg_lift_support_contact` along with the other retired
+    v8.x patches (module docstring's own removal list) on the reasoning that
+    the restored stock joint-pose anchors would keep the 3 support legs
+    honest -- true for most of the removed terms, WRONG for this one
+    specifically: it was the only term directly penalizing a support leg for
+    losing ground contact. stand_still/joint_pos_penalty only pull joints
+    toward default indirectly; a small joint deviation can lift a foot with
+    no direct penalty for the contact loss itself. Bench data pointed at
+    exactly this: forward's contamination pattern was RL_calf lifting
+    alongside the commanded FR (and back's weaker, symmetric RL/FR pair) --
+    FR/RL is the diagonal pair a trot gait moves together BY CONSTRUCTION,
+    and Stage 1 warm-started from a walk (trot) donor, so a residual
+    "these two move together" reflex going unpunished is the most likely
+    explanation for exactly this asymmetry (not right/left's RR/FL pair).
+
+    Deliberately NOT v8's own old support_contact logic (docstring's removal
+    list, `leg_lift_foot_height`'s own comment on the exploit it and
+    `leg_lift_selected_height` shared): v8 measured RELATIVE clearance
+    against the other feet's average height, which a robot can satisfy by
+    crouching all three support legs together -- exactly as effective at
+    raising "clearance" as actually lifting the selected foot, and just as
+    exploitable here. This version checks binary ground contact directly
+    (`current_air_time > 0`, from the same contact sensor foot_on_air/
+    foot_air_time already use) on the 3 NON-selected legs -- there is no
+    relative measurement for a synchronized crouch to game.
+
+    Symmetric by design (same weight, same logic for all 4 possible support-
+    leg sets depending on which leg is selected) -- NOT a special case for
+    FR/RL. The point is closing the general hole the removal left; if the
+    walk-donor diagonal-pair hypothesis is right, a uniform penalty applied
+    to whichever legs are currently "support" is enough on its own without
+    hand-coding which pair to watch, and the network resolves the specific
+    asymmetry itself."""
+    term = env.command_manager.get_term(command_name)
+    contact_sensor = env.scene.sensors[sensor_cfg.name]
+    current_air_time = contact_sensor.data.current_air_time[:, sensor_cfg.body_ids]  # [N,4]
+    airborne = (current_air_time > 0.0).float()
+    selected_mask = _selected_leg_mask(env, command_name)
+    support_mask = 1.0 - selected_mask  # the 3 legs NOT commanded to lift
+    active = (term.signal > 0.5).float()
+    return (airborne * support_mask).sum(dim=1) * active
+
+
 class UnitreeB2LegLiftRoughEnvCfg(UnitreeB2RoughEnvCfg):
     """See module docstring -- a deliberately simple test skill, not a production one."""
 
@@ -547,12 +596,55 @@ class UnitreeB2LegLiftRoughEnvCfg(UnitreeB2RoughEnvCfg):
         # nothing else, warm-started from walk's general locomotion skill
         # but with the novel lift objective entirely absent so there's no
         # large new gradient competing with re-learning to stand still.
-        # Gate: bench-idle pitch <3 deg (base's threshold). Stage 1 (already
-        # designed, not yet run) ramps these three weights back 0->10/5/5
-        # from whatever checkpoint clears this gate.
+        # Gate: bench-idle pitch <3 deg (base's threshold).
+        #
+        # STAGE 0 RESULT (2026-08-21, same day): gate PASSED -- a sharp
+        # phase transition between it1100 (plateau at -13..-15deg, no
+        # trend) and it2100 (pitch +-1.5deg the whole 3s bench rollout,
+        # base_z~0.55m, 4 feet in contact almost throughout). Rear joints
+        # still deviate from literal default_joint_pos (RR_thigh+0.257,
+        # RL_thigh+0.124) but this is now WORKING gravity precompensation
+        # that HOLDS pitch level, not the cause of a lean -- a genuinely
+        # different regime from all 9 prior failures. Confirms base's
+        # reframing: the policy family could always learn this, it just
+        # never had a task where standing was the sole, uncontested
+        # objective. Full numbers: TRAINING_STATE.md 20:30 entry.
+        #
+        # STAGE 1 (base's design): ramp these three weights back up from
+        # the Stage 0 donor checkpoint via IsaacLab's own stock
+        # `mdp.modify_reward_weight` curriculum term (see CurriculumCfg
+        # below) instead of new custom code. Piecewise, not linear:
+        # 25% -> 50% -> 100% of target. The 25% stage is baked directly
+        # into these RewTerm weights below (NOT weight=0.0 like Stage 0)
+        # because `disable_zero_weight_rewards()` drops any weight==0 term
+        # from the reward manager entirely, and `modify_reward_weight`
+        # needs `env.reward_manager.get_term_cfg(term_name)` to find an
+        # already-registered term to grab onto -- starting at 0 and
+        # curriculum-stepping to 25% first (as base's "3 steps" phrasing
+        # literally implies) isn't possible without also patching
+        # disable_zero_weight_rewards() itself, which this deliberately
+        # avoids. Documented deviation, not a silent one.
+        # POST-CRASH FIX (2026-08-21, 22:1x, same day): a full machine reboot
+        # killed this run at it10200 (the it+2000-gated checkpoint). Resuming
+        # from that checkpoint reloads the TRAINED POLICY correctly, but
+        # `common_step_counter` (what the curriculum thresholds below are
+        # measured against) is process-local and does NOT survive -- it
+        # restarts at 0, so the curriculum terms below would re-ramp
+        # 25%->50%->100% from scratch even though the network is already
+        # fully trained under the 100% economy. Confirmed by number, not
+        # assumed (base's instruction): first post-resume iteration showed
+        # Curriculum/leg_lift_foot_height_ramp_100=2.5 (should be 10.0) and
+        # Episode_Reward/leg_lift_foot_height crashed to 0.09 (was ~3.9)
+        # while the iteration counter correctly continued from 10200 --
+        # exactly this mismatch, not a policy regression. Fix: these three
+        # initial weights now start DIRECTLY at the final target (10/5/5)
+        # instead of 25% -- the policy doesn't need re-ramping, it's already
+        # trained for the full economy. The curriculum terms further below
+        # are left in place (harmless no-ops: they'll fire again on their
+        # own env-step thresholds and just reaffirm these same values).
         self.rewards.leg_lift_foot_height = RewTerm(
             func=leg_lift_foot_height,
-            weight=0.0,
+            weight=10.0,
             params={
                 "command_name": "base_velocity",
                 "asset_cfg": SceneEntityCfg("robot", body_names=FOOT_BODY_NAMES, preserve_order=True),
@@ -560,7 +652,7 @@ class UnitreeB2LegLiftRoughEnvCfg(UnitreeB2RoughEnvCfg):
         )
         self.rewards.leg_lift_foot_on_air = RewTerm(
             func=leg_lift_foot_on_air,
-            weight=0.0,
+            weight=5.0,
             params={
                 "command_name": "base_velocity",
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=FOOT_BODY_NAMES, preserve_order=True),
@@ -568,7 +660,7 @@ class UnitreeB2LegLiftRoughEnvCfg(UnitreeB2RoughEnvCfg):
         )
         self.rewards.leg_lift_foot_air_time = RewTerm(
             func=leg_lift_foot_air_time,
-            weight=0.0,
+            weight=5.0,
             params={
                 "command_name": "base_velocity",
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=FOOT_BODY_NAMES, preserve_order=True),
@@ -577,6 +669,82 @@ class UnitreeB2LegLiftRoughEnvCfg(UnitreeB2RoughEnvCfg):
                 # Unchanged value from v8 (never implicated in any failure).
                 "threshold": 1.0,
             },
+        )
+
+        # v9.5 FIX: closes the hole v9's own removal of leg_lift_support_contact
+        # left (see the function's own docstring for the full diagnosis --
+        # forward's systematic gate failure, RL_calf contamination, walk-donor
+        # diagonal-pair hypothesis). Weight -2.0 matches stand_still_without_
+        # cmd's own magnitude -- same role (keep the non-participating legs
+        # honest), same order of pressure, not a new escalation scale.
+        #
+        # v9.5.1 (2026-08-22, same day, base's diagnosis after the -2.0 gate):
+        # -2.0 fixed forward's contamination MOST of the time but a dense
+        # 6-point recheck (it30700-31200, ~100-iter steps) found BIMODAL
+        # behavior -- forward clusters into two discrete regimes (~3.6s PASS
+        # vs ~1.4-1.8s FAIL), not a smooth trend or noise (confirmed
+        # deterministic: 3/3 identical repeats on both a PASS and a FAIL
+        # checkpoint, same bench+ONNX, no measurement noise). Diagnostic
+        # comparison (scratchpad/diagnose_forward_bimodal.py) between a FAIL
+        # and a PASS checkpoint found the support_contact penalty accounts
+        # for the difference (16.0 vs 0.0 penalty-steps during the hold) but
+        # ALSO found jerkier control in FAIL mode (action-delta ~4x higher,
+        # peak torque ~2x higher, mean torque nearly identical) -- base's
+        # read: the jerkiness is the CONSEQUENCE of the contact loss (a
+        # scramble to rebalance), not an independent second cause, so
+        # raising this same weight should fix both symptoms together. One
+        # step, -2.0 -> -4.0, same reasoning as before (comparable to a
+        # doubled stand_still_without_cmd, not a new escalation scale).
+        # Gate: same dense 5-6-point check on forward for stable PASS on
+        # every point (not "average improved"), PLUS compare forward's own
+        # action-delta/max-torque against right/back/left on the SAME
+        # checkpoints post-fix -- if forward's jerkiness collapses to match
+        # the other 3 once its position-hold stabilizes, the causality
+        # hypothesis is confirmed; if it stays elevated even once forward
+        # reliably PASSes, jerkiness is an independent, separate issue.
+        self.rewards.leg_lift_support_contact = RewTerm(
+            func=leg_lift_support_contact,
+            weight=-4.0,
+            params={
+                "command_name": "base_velocity",
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=FOOT_BODY_NAMES, preserve_order=True),
+            },
+        )
+
+        # STAGE 1 curriculum ramp: 50% at +1000 iterations, 100% at +2000
+        # iterations (base's thresholds; the 25% stage is the initial
+        # weight above, see that comment). `modify_reward_weight`'s own
+        # `num_steps` param is raw env steps (env.common_step_counter),
+        # NOT training iterations -- converted via this run's own
+        # num_steps_per_env=24 (agent.yaml, PPO rollout horizon):
+        # 1000 * 24 = 24000, 2000 * 24 = 48000. common_step_counter is a
+        # fresh-process-local counter (ManagerBasedRLEnv.__init__ sets it
+        # to 0, never restored from a checkpoint), so these thresholds are
+        # relative to Stage 1's OWN launch, independent of the absolute
+        # iteration number carried over from the walk/Stage-0 lineage.
+        self.curriculum.leg_lift_foot_height_ramp_50 = CurrTerm(
+            func=mdp.modify_reward_weight,
+            params={"term_name": "leg_lift_foot_height", "weight": 5.0, "num_steps": 24000},
+        )
+        self.curriculum.leg_lift_foot_height_ramp_100 = CurrTerm(
+            func=mdp.modify_reward_weight,
+            params={"term_name": "leg_lift_foot_height", "weight": 10.0, "num_steps": 48000},
+        )
+        self.curriculum.leg_lift_foot_on_air_ramp_50 = CurrTerm(
+            func=mdp.modify_reward_weight,
+            params={"term_name": "leg_lift_foot_on_air", "weight": 2.5, "num_steps": 24000},
+        )
+        self.curriculum.leg_lift_foot_on_air_ramp_100 = CurrTerm(
+            func=mdp.modify_reward_weight,
+            params={"term_name": "leg_lift_foot_on_air", "weight": 5.0, "num_steps": 48000},
+        )
+        self.curriculum.leg_lift_foot_air_time_ramp_50 = CurrTerm(
+            func=mdp.modify_reward_weight,
+            params={"term_name": "leg_lift_foot_air_time", "weight": 2.5, "num_steps": 24000},
+        )
+        self.curriculum.leg_lift_foot_air_time_ramp_100 = CurrTerm(
+            func=mdp.modify_reward_weight,
+            params={"term_name": "leg_lift_foot_air_time", "weight": 5.0, "num_steps": 48000},
         )
 
         # If the weight of rewards is 0, set rewards to None
