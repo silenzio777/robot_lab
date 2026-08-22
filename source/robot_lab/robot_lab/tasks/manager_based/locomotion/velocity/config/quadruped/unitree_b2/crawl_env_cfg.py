@@ -1,9 +1,47 @@
 # Copyright (c) 2024-2025 Ziqi Fan
 # SPDX-License-Identifier: Apache-2.0
 
+import torch
+
+from isaaclab.managers import RewardTermCfg as RewTerm
+from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 
+import robot_lab.tasks.manager_based.locomotion.velocity.mdp as mdp
+
 from .rough_env_cfg import UnitreeB2RoughEnvCfg
+
+
+def crawl_base_height_l2(
+    env,
+    command_name: str,
+    command_threshold: float,
+    target_height: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    sensor_cfg: SceneEntityCfg | None = None,
+) -> torch.Tensor:
+    """`mdp.base_height_l2`, gated to fire ONLY while actively crawling
+    (|command| > threshold) -- the exact inverted form of the gate
+    `feet_height_body` already uses in mdp/rewards.py (`> threshold` there,
+    vs `stand_still_without_cmd`'s own `< threshold`), reused here rather
+    than invented fresh.
+
+    2026-08-22 CRAWLING redo (base+train design, see train_research/
+    CRAWLING_REDO_TASK.md and TRAINING_STATE.md same date): stock
+    `base_height_l2` has no command-gate param at all, so this repo-local
+    wrapper exists specifically to add one -- editing the SHARED mdp.
+    base_height_l2 itself was rejected to avoid touching rough/walk/
+    leg_lift's own unrelated use of that term. Without this gate, crawl
+    stayed in its low crouch target even at cmd=0 (idle), conflicting with
+    the shared-anchor requirement that every skill's idle pose matches
+    `stage_a_standing`'s tall stance. Un-gated, `base_height_l2` fires
+    every timestep regardless of command -- gating it to "moving only"
+    and restoring `stand_still_without_cmd` (see this file's own
+    __post_init__) to the stock value it had before 2026-08-02's redesign
+    cleanly separates the two regimes instead of fighting over one term."""
+    reward = mdp.base_height_l2(env, target_height=target_height, asset_cfg=asset_cfg, sensor_cfg=sensor_cfg)
+    reward = reward * (torch.linalg.norm(env.command_manager.get_command(command_name), dim=1) > command_threshold)
+    return reward
 
 
 @configclass
@@ -83,6 +121,28 @@ class UnitreeB2CrawlRoughEnvCfg(UnitreeB2RoughEnvCfg):
     added to) is loaded once at construction and never varies with the live command
     value; nothing on the deployment side substitutes a different anchor pose at
     cmd_vel=0. The fix belongs entirely here, in reward shaping.
+
+    2026-08-22 CRAWLING redo (base+train design, owner-confirmed decision -- see
+    train_research/CRAWLING_REDO_TASK.md/TRAINING_STATE.md same date): the 2026-08-02
+    reasoning above ("no crawl-specific ideal standstill pose to substitute in
+    [stand_still_without_cmd's] place") no longer holds -- `confirmed_skills/
+    stage_a_standing` (leg_lift Stage A's confirmed tall-standing checkpoint) now IS
+    that pose, shared across every redo'd skill (crawling/rear_stand/walk) so
+    switching between them on real hardware doesn't jerk. Owner ruled the
+    always-low-crouch-even-at-idle behavior a BUG (same class of accidental stock-
+    idle-package zeroing that cost leg_lift 9 failed versions), not a deliberate
+    feature (e.g. ground clearance held even while standing under an obstacle) --
+    reversible if that call turns out wrong.
+
+    Fix: `base_height_l2` gated to fire ONLY while actively crawling
+    (`crawl_base_height_l2`, this module -- reuses `feet_height_body`'s own existing
+    `> command_threshold` gate pattern instead of inventing a new one), freeing
+    `stand_still_without_cmd` to be restored to its stock weight for the idle
+    regime. The two terms now own disjoint regimes instead of one unconditionally
+    overpowering the other. Resumes from `stage_a_standing`'s own checkpoint
+    (--resume --checkpoint, NEW seed directory) rather than the original walking
+    donor -- see the launch command in TRAINING_STATE.md. Does NOT touch
+    `confirmed_skills/crawling`'s own bench-button checkpoint/onnx.
     """
 
     def __post_init__(self):
@@ -90,10 +150,35 @@ class UnitreeB2CrawlRoughEnvCfg(UnitreeB2RoughEnvCfg):
         super().__post_init__()
 
         # override rewards -- see class docstring for the full reasoning
-        self.rewards.base_height_l2.weight = -8.0
-        self.rewards.base_height_l2.params["target_height"] = 0.35
+        #
+        # 2026-08-22 CRAWLING redo (base+train design, shared-idle-anchor
+        # requirement -- see crawl_base_height_l2's own docstring above for
+        # the full rationale): base_height_l2 now gated to fire ONLY while
+        # actively crawling (command_threshold=0.1, same convention as
+        # feet_height_body/stand_still_without_cmd elsewhere in this repo),
+        # NOT every timestep regardless of command as before. This is what
+        # makes restoring stand_still_without_cmd to its stock weight (below)
+        # safe -- the two terms now own disjoint regimes (moving vs idle)
+        # instead of base_height_l2 unconditionally overpowering it.
+        self.rewards.base_height_l2 = RewTerm(
+            func=crawl_base_height_l2,
+            weight=-8.0,
+            params={
+                "command_name": "base_velocity",
+                "command_threshold": 0.1,
+                "target_height": 0.35,
+            },
+        )
         self.rewards.feet_height_body.weight = 0
-        self.rewards.stand_still_without_cmd.weight = 0
+        # 0 -> -2.0 (2026-08-22 redo): restored to the stock value this term
+        # had before 2026-08-02's redesign zeroed it. That redesign's own
+        # reasoning ("no crawl-specific ideal standstill pose to substitute
+        # in its place") no longer holds -- stage_a_standing now IS that
+        # pose, shared across every skill for FSM-transition smoothness on
+        # real hardware. See CRAWLING_REDO_TASK.md/TRAINING_STATE.md
+        # 2026-08-22 for the full owner-confirmed decision (bug, not a
+        # deliberate low-crouch-always feature).
+        self.rewards.stand_still_without_cmd.weight = -2.0
         self.rewards.joint_pos_penalty.params["stand_still_scale"] = 1.0
 
         # If the weight of rewards is 0, set rewards to None
