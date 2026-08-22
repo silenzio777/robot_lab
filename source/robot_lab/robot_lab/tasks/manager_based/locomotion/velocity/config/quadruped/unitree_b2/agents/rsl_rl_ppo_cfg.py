@@ -98,6 +98,22 @@ class UnitreeB2RearStandPPORunnerCfg(UnitreeB2RoughPPORunnerCfg):
 
 
 @configclass
+class UnitreeB2RearStandStageAPPORunnerCfg(UnitreeB2RearStandPPORunnerCfg):
+    def __post_init__(self):
+        super().__post_init__()
+
+        # Own logs/rsl_rl/unitree_b2_rear_stand_stage_a/ directory -- same split
+        # reasoning as crawl/jump's own experiment_name overrides above: Stage A
+        # (3-slot command, see rear_stand_env_cfg.py's RearStandStageACommand)
+        # is a genuinely different network input shape than the full 6-slot
+        # RearStand task, so its checkpoints must never land in (or get
+        # confused with) unitree_b2_rear_stand/'s own directory. Inherits the
+        # parent's entropy_coef=0.005 (same reward economy minus 2 terms, same
+        # stability profile expected) rather than reverting to Rough's default.
+        self.experiment_name = "unitree_b2_rear_stand_stage_a"
+
+
+@configclass
 class UnitreeB2JumpPPORunnerCfg(UnitreeB2RoughPPORunnerCfg):
     def __post_init__(self):
         super().__post_init__()

@@ -321,6 +321,83 @@ class RearStandCommandCfg(CommandTermCfg):
     debug_vis: bool = False
 
 
+class RearStandStageACommand(CommandTerm):
+    """Stage A (2026-08-22, base+train design, see train_research/
+    TRAINING_STATE.md same date): pure vertical stand only, 3-slot command
+    [stand_signal, 0, 0] -- matches `stage_a_standing`'s (leg_lift Stage A,
+    confirmed_skills/stage_a_standing) own width EXACTLY, unlike the full
+    RearStandCommand (6-slot, v5.1: stand/walk/sin/cos/turn/cadence). This is
+    what enables a LITERAL weight warm-start (`--resume --checkpoint` from
+    that anchor) via plain state_dict shape-matching -- the same technique
+    leg_lift v9.4 used to warm-start FROM walk (there: leg_lift widened
+    2->3 to match walk's width; here: rear_stand narrows 6->3 to match the
+    anchor's width). No custom weight-copying code -- verified by reading
+    v9.4's own commit (03e9089) that no such loader exists in this codebase,
+    only exact-shape resume ever has.
+
+    Same rise/hold/descend clock as the full RearStandCommand, stripped of
+    the walk/turn/gait-phase machinery entirely (not just zeroed -- absent
+    from the tensor). This machinery has been PRACTICALLY inert in the full
+    class since v6 anyway (CMD_STILL_PROB=1.0/CMD_WALK_PROB=0.0, owner's
+    "по маленьким шагам" staging order) -- Stage A doesn't remove a live
+    behavior, it removes width that was never being used, purely for the
+    warm-start shape match.
+
+    Stage B (once Stage A passes its own numeric gate -- see the 2026-08-22
+    ~15:45 TRAINING_STATE.md entry for the pre-registered criteria) widens
+    back to the full 6-slot RearStandCommand the SAME way: warm-starting
+    from Stage A's OWN checkpoint (not from stage_a_standing directly),
+    reusing this proven width-match technique a second time instead of a
+    new one."""
+
+    cfg: "RearStandStageACommandCfg"
+
+    def __init__(self, cfg: "RearStandStageACommandCfg", env) -> None:
+        super().__init__(cfg, env)
+        n = self.num_envs
+        # columns 1,2 stay exactly 0.0 forever -- matching stage_a_standing's
+        # [vx, vy, 0] shape 1-in-1 for the warm-start.
+        self._command = torch.zeros(n, 3, device=self.device)
+        self.signal = torch.zeros(n, device=self.device)
+        self.idle_duration = torch.zeros(n, device=self.device)
+        self.hold_duration = torch.zeros(n, device=self.device)
+        self.cycle_duration = torch.zeros(n, device=self.device)
+
+    @property
+    def command(self) -> torch.Tensor:
+        return self._command
+
+    def _update_metrics(self):
+        self.metrics["stand_signal"] = self.signal.clone()
+
+    def _resample_command(self, env_ids):
+        idle = torch.empty(len(env_ids), device=self.device).uniform_(*self.cfg.idle_time_range)
+        hold = torch.empty(len(env_ids), device=self.device).uniform_(*self.cfg.hold_time_range)
+        self.idle_duration[env_ids] = idle
+        self.hold_duration[env_ids] = hold
+        self.cycle_duration[env_ids] = idle + RISE_DURATION + hold + DESCEND_DURATION
+        self.time_left[env_ids] = self.cycle_duration[env_ids]
+
+    def _update_command(self):
+        elapsed = self.cycle_duration - self.time_left
+        rise_start = self.idle_duration
+        hold_start = rise_start + RISE_DURATION
+        descend_start = hold_start + self.hold_duration
+        rising = ((elapsed - rise_start) / RISE_DURATION).clamp(0.0, 1.0)
+        descending = ((elapsed - descend_start) / DESCEND_DURATION).clamp(0.0, 1.0)
+        self.signal = rising - descending  # 0 idle, ramps up, holds 1, ramps down
+        self._command[:, 0] = self.signal
+
+
+@configclass
+class RearStandStageACommandCfg(CommandTermCfg):
+    class_type: type = RearStandStageACommand
+    resampling_time_range: tuple[float, float] = (8.0, 14.0)  # nominal; overwritten per cycle
+    idle_time_range: tuple[float, float] = (1.5, 3.0)
+    hold_time_range: tuple[float, float] = (8.0, 14.0)
+    debug_vis: bool = False
+
+
 def _fwd_axis_z(asset) -> torch.Tensor:
     """World-Z component of the body +X axis: 0 horizontal, 1 nose-straight-up."""
     q = asset.data.root_quat_w
@@ -1127,3 +1204,52 @@ class UnitreeB2RearStandRoughEnvCfg(UnitreeB2RoughEnvCfg):
         # If the weight of rewards is 0, set rewards to None
         if self.__class__.__name__ == "UnitreeB2RearStandRoughEnvCfg":
             self.disable_zero_weight_rewards()
+
+
+@configclass
+class UnitreeB2RearStandStageAEnvCfg(UnitreeB2RearStandRoughEnvCfg):
+    """Stage A: pure vertical stand, 3-slot command matching `stage_a_standing`'s
+    own width for a literal weight warm-start -- see RearStandStageACommand's
+    own docstring for the full rationale (2026-08-22, base+train design,
+    train_research/TRAINING_STATE.md same date).
+
+    Reuses the FULL parent reward economy unchanged via super().__post_init__()
+    -- it's already stand-only in practice (CMD_STILL_PROB=1.0 since v6 means
+    walk_vx/turn_wz are always 0 even in the parent's 6-slot command). Only
+    removes the two terms that directly index command slot 4
+    (rear_stand_turn_tracking, rear_stand_walk_drift) -- these would raise
+    IndexError on this class's 3-wide command tensor (valid indices 0-2 only).
+    Everything reading command[:,1] (rear_stand_walk_tracking/low_speed/
+    feet_clearance/rear_feet_contact's "walking" gate) stays included and
+    safe: slot 1 is always 0.0 by construction here, so those terms' walk
+    branches stay provably dead -- same as they already are in the parent
+    class today (walking was already unreachable there too, just for a
+    different reason: CMD_WALK_PROB=0.0 sampling instead of tensor width).
+
+    Stage B (once this passes its own numeric gate -- see the 2026-08-22
+    ~15:45 TRAINING_STATE.md entry for the pre-registered criteria: forward-
+    axis-Z >=0.996, rear calf angle within +-0.15-0.2rad of
+    REAR_LEG_EXTENSION_TARGET plus rear-foot contact, front-feet-height
+    >=80% of target without ground contact) is NOT this class -- it's a
+    separate config that widens back to UnitreeB2RearStandRoughEnvCfg's own
+    6-slot RearStandCommandCfg, warm-starting from THIS class's own
+    checkpoint (not from stage_a_standing directly), reusing the proven
+    width-match technique a second time instead of a new one. Not yet
+    written -- write only after Stage A itself clears its gate, per the
+    same discipline as leg_lift's Stage 0->Stage 1."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.commands.base_velocity = RearStandStageACommandCfg()
+
+        # Both read command[:,4] (turn_wz) -- IndexError on a 3-wide tensor
+        # (valid indices 0-2 only). Weight to 0 first, then
+        # disable_zero_weight_rewards() below converts them to None (dropped
+        # from the RewardManager entirely, not just multiplied by 0 -- the
+        # function itself must never be CALLED, since calling it is what
+        # would raise the IndexError, not merely using its result).
+        self.rewards.rear_stand_turn_tracking.weight = 0
+        self.rewards.rear_stand_walk_drift.weight = 0
+
+        self.disable_zero_weight_rewards()

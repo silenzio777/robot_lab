@@ -92,6 +92,20 @@ gym.register(
 )
 
 gym.register(
+    # Stage A: 3-slot command matching stage_a_standing's own width, for a
+    # literal weight warm-start from that anchor (2026-08-22, base+train
+    # design). See UnitreeB2RearStandStageAEnvCfg's own docstring.
+    id="RobotLab-Isaac-Velocity-Rough-Unitree-B2-RearStandStageA-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rear_stand_env_cfg:UnitreeB2RearStandStageAEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeB2RearStandStageAPPORunnerCfg",
+        "cusrl_cfg_entry_point": f"{agents.__name__}.cusrl_ppo_cfg:UnitreeB2RoughTrainerCfg",
+    },
+)
+
+gym.register(
     id="RobotLab-Isaac-Velocity-Rough-Unitree-B2-LegLift-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
