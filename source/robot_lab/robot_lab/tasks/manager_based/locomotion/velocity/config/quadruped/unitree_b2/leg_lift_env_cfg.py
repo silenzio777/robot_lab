@@ -122,6 +122,32 @@ LIFT_HEIGHT_LEVEL_DOWN = 0.006  # m, gentler per-cycle regression on failure
 LIFT_HEIGHT_SUCCESS_TOL = 0.05  # m
 LIFT_HEIGHT_SUCCESS_DURATION = 1.5  # s, cumulative in-tolerance time needed
 
+# v9.6 (2026-08-22, compressed single-run reproducibility test, owner's direct
+# request after LEG_LIFT v9.5.1: "sokraschyonny povtor vsego treka, v odin
+# ran"): the original v9.4->v9.5.1 chain went walk-warm-start -> Stage 0
+# (separate process, pure standing, lift weights literally 0) -> gate-checked
+# by hand -> Stage 1 (separate process, curriculum ramp) -> ... -> v9.5.1,
+# five resumes across ~9 launches. This constant collapses Stage 0+Stage 1
+# into ONE continuous run: below this env-step count, LegLiftCommand forces
+# signal/command to stay 0 for every env (see _update_command below) --
+# literally Stage 0's own behavior (no lift cycle fires at all), not just a
+# zero reward weight. base's code review (2026-08-22) found a real gap in an
+# earlier draft of this plan: leg_lift_masked_stand_still_without_cmd/
+# leg_lift_masked_joint_pos_penalty's exemption is `mask * term.signal`,
+# independent of the lift RewTerms' own weight -- if the command cycle ran
+# from iteration 0 while lift weights were still ramping from a curriculum
+# start, the selected leg could go anchor-free with no lift-reward to
+# replace it, right when the network is most fragile (fresh off the walk
+# warm-start). Gating the COMMAND CYCLE itself on this same threshold closes
+# that hole structurally instead of relying on lucky timing sync.
+# 2100 iterations = the empirically-measured Stage 0 convergence point from
+# 2026-08-21 (clean idle standing achieved it1100->2100, see TRAINING_STATE.md)
+# -- base's explicit caution: don't try to compress THIS number too, it's the
+# one thing this plan doesn't have independent evidence will still hold in a
+# fresh run (seed variance is real, untested). num_steps_per_env=24 (this
+# task's agent.yaml, unchanged from the original run) -> 2100*24=50400.
+STANDING_CONSOLIDATION_STEPS = 50400  # env.common_step_counter units
+
 TRACKING_SIGMA = 0.01  # m^2 -- reused for the new absolute-height kernel
 # too; see the pre-flight check in TRAIN_RESEARCH.md/TRAINING_STATE.md for
 # the numeric verification this gives a live (non-e-16) gradient at rest
@@ -255,6 +281,15 @@ class LegLiftCommand(CommandTerm):
         self._hold_entered[env_ids] = False
 
     def _update_command(self):
+        # v9.6 gate (see STANDING_CONSOLIDATION_STEPS's own comment): before
+        # standing has had time to consolidate, force every env to stay
+        # idle -- no rise/hold/descend cycle at all, matching literal
+        # Stage 0 behavior rather than just zeroing a reward weight. This
+        # is what closes the mask/signal anchor-hole base's review found.
+        if self._env.common_step_counter < STANDING_CONSOLIDATION_STEPS:
+            self.signal[:] = 0.0
+            self._command[:] = 0.0
+            return
         elapsed = self.cycle_duration - self.time_left
         rise_start = self.idle_duration
         hold_start = rise_start + self.cfg.rise_duration
@@ -636,15 +671,29 @@ class UnitreeB2LegLiftRoughEnvCfg(UnitreeB2RoughEnvCfg):
         # Curriculum/leg_lift_foot_height_ramp_100=2.5 (should be 10.0) and
         # Episode_Reward/leg_lift_foot_height crashed to 0.09 (was ~3.9)
         # while the iteration counter correctly continued from 10200 --
-        # exactly this mismatch, not a policy regression. Fix: these three
-        # initial weights now start DIRECTLY at the final target (10/5/5)
-        # instead of 25% -- the policy doesn't need re-ramping, it's already
-        # trained for the full economy. The curriculum terms further below
-        # are left in place (harmless no-ops: they'll fire again on their
-        # own env-step thresholds and just reaffirm these same values).
+        # exactly this mismatch, not a policy regression. Fix (v9.5.1): these
+        # three initial weights started DIRECTLY at the final target (10/5/5)
+        # instead of 25% for that specific resumed run.
+        #
+        # v9.6 (2026-08-22, compressed single-run reproducibility test):
+        # back to the ORIGINAL 25% baked-in starting point (2.5/1.25/1.25),
+        # because THIS run is single-process/continuous from iteration 0 --
+        # the post-crash mismatch above can't occur here (no restart), so
+        # there's no reason to skip the curriculum ramp this time. Still
+        # can't start these three at literal 0.0 (same constraint as the
+        # original Stage 1: `disable_zero_weight_rewards()` drops any
+        # weight==0 term from the reward manager entirely, and
+        # `modify_reward_weight` needs the term already registered to grab
+        # onto). Harmless to bake at 25% from iteration 0 this time
+        # specifically BECAUSE of STANDING_CONSOLIDATION_STEPS: all three
+        # functions below are structurally gated on `signal`/the mask (see
+        # each one's own docstring), and signal is forced to 0 by
+        # LegLiftCommand._update_command until that same threshold -- so
+        # these weights are real but inert (output=0 regardless of weight)
+        # for the whole consolidation phase, then ramp for real afterward.
         self.rewards.leg_lift_foot_height = RewTerm(
             func=leg_lift_foot_height,
-            weight=10.0,
+            weight=2.5,
             params={
                 "command_name": "base_velocity",
                 "asset_cfg": SceneEntityCfg("robot", body_names=FOOT_BODY_NAMES, preserve_order=True),
@@ -652,7 +701,7 @@ class UnitreeB2LegLiftRoughEnvCfg(UnitreeB2RoughEnvCfg):
         )
         self.rewards.leg_lift_foot_on_air = RewTerm(
             func=leg_lift_foot_on_air,
-            weight=5.0,
+            weight=1.25,
             params={
                 "command_name": "base_velocity",
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=FOOT_BODY_NAMES, preserve_order=True),
@@ -660,7 +709,7 @@ class UnitreeB2LegLiftRoughEnvCfg(UnitreeB2RoughEnvCfg):
         )
         self.rewards.leg_lift_foot_air_time = RewTerm(
             func=leg_lift_foot_air_time,
-            weight=5.0,
+            weight=1.25,
             params={
                 "command_name": "base_velocity",
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=FOOT_BODY_NAMES, preserve_order=True),
@@ -716,35 +765,41 @@ class UnitreeB2LegLiftRoughEnvCfg(UnitreeB2RoughEnvCfg):
         # weight above, see that comment). `modify_reward_weight`'s own
         # `num_steps` param is raw env steps (env.common_step_counter),
         # NOT training iterations -- converted via this run's own
-        # num_steps_per_env=24 (agent.yaml, PPO rollout horizon):
-        # 1000 * 24 = 24000, 2000 * 24 = 48000. common_step_counter is a
-        # fresh-process-local counter (ManagerBasedRLEnv.__init__ sets it
-        # to 0, never restored from a checkpoint), so these thresholds are
-        # relative to Stage 1's OWN launch, independent of the absolute
-        # iteration number carried over from the walk/Stage-0 lineage.
+        # num_steps_per_env=24 (agent.yaml, PPO rollout horizon).
+        #
+        # v9.6 (2026-08-22): this run is single-process/continuous from
+        # iteration 0 (no separate Stage 1 launch), so these thresholds are
+        # NOT relative to a fresh process start like the original -- they're
+        # relative to the SAME absolute common_step_counter that
+        # STANDING_CONSOLIDATION_STEPS (50400 = it2100) is measured against.
+        # Recomputed, not copied: (2100+1000)*24=74400, (2100+2000)*24=98400
+        # -- same +1000/+2000-iteration-equivalent windows as the original
+        # Stage 1, just offset from the shared origin instead of a separate
+        # counter. base's explicit warning: do NOT reuse the raw 24000/48000
+        # numbers here, they were relative to a different counter's zero.
         self.curriculum.leg_lift_foot_height_ramp_50 = CurrTerm(
             func=mdp.modify_reward_weight,
-            params={"term_name": "leg_lift_foot_height", "weight": 5.0, "num_steps": 24000},
+            params={"term_name": "leg_lift_foot_height", "weight": 5.0, "num_steps": 74400},
         )
         self.curriculum.leg_lift_foot_height_ramp_100 = CurrTerm(
             func=mdp.modify_reward_weight,
-            params={"term_name": "leg_lift_foot_height", "weight": 10.0, "num_steps": 48000},
+            params={"term_name": "leg_lift_foot_height", "weight": 10.0, "num_steps": 98400},
         )
         self.curriculum.leg_lift_foot_on_air_ramp_50 = CurrTerm(
             func=mdp.modify_reward_weight,
-            params={"term_name": "leg_lift_foot_on_air", "weight": 2.5, "num_steps": 24000},
+            params={"term_name": "leg_lift_foot_on_air", "weight": 2.5, "num_steps": 74400},
         )
         self.curriculum.leg_lift_foot_on_air_ramp_100 = CurrTerm(
             func=mdp.modify_reward_weight,
-            params={"term_name": "leg_lift_foot_on_air", "weight": 5.0, "num_steps": 48000},
+            params={"term_name": "leg_lift_foot_on_air", "weight": 5.0, "num_steps": 98400},
         )
         self.curriculum.leg_lift_foot_air_time_ramp_50 = CurrTerm(
             func=mdp.modify_reward_weight,
-            params={"term_name": "leg_lift_foot_air_time", "weight": 2.5, "num_steps": 24000},
+            params={"term_name": "leg_lift_foot_air_time", "weight": 2.5, "num_steps": 74400},
         )
         self.curriculum.leg_lift_foot_air_time_ramp_100 = CurrTerm(
             func=mdp.modify_reward_weight,
-            params={"term_name": "leg_lift_foot_air_time", "weight": 5.0, "num_steps": 48000},
+            params={"term_name": "leg_lift_foot_air_time", "weight": 5.0, "num_steps": 98400},
         )
 
         # If the weight of rewards is 0, set rewards to None
