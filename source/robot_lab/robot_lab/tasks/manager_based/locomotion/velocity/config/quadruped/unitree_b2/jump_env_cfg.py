@@ -170,6 +170,21 @@ class JumpPulseCommand(CommandTerm):
         # computed once per step in _update_command, read by every reward
         # function that used to read root_pos_w for "how high is the jump".
         self.min_foot_clearance = torch.zeros(n, device=self.device)
+        # 2026-08-23 night, base's review: MANDATORY pre-flight sanity check
+        # for the very first live IsaacLab run under this redesign -- the
+        # FOOT_GEOM_LOCAL_OFFSET/sphere-radius calibration above was only
+        # verified against the MuJoCo bench (~0.027m standing residual,
+        # train had no live IsaacLab env available to cross-check against --
+        # WALK training held the only GPU that night). Prints
+        # min_foot_clearance's own standing value ONCE, on this run's first
+        # _update_command call, so it's visible in the training log without
+        # extra tooling. If IsaacLab's own calf-body frame convention
+        # differs from the MuJoCo bench in any way, this number will NOT
+        # land near ~0.02-0.03m -- STOP and re-derive FOOT_GEOM_LOCAL_OFFSET
+        # against a live env before trusting anything downstream of
+        # min_foot_clearance (every height/flight-detection term in this
+        # redesign).
+        self._clearance_calibration_printed = False
 
     @property
     def command(self) -> torch.Tensor:
@@ -260,6 +275,15 @@ class JumpPulseCommand(CommandTerm):
         ).reshape(n_envs, 4, 3)
         foot_pos_w = calf_pos_w + world_offset
         self.min_foot_clearance = foot_pos_w[:, :, 2].min(dim=1).values
+        if not self._clearance_calibration_printed:
+            print(
+                f"[JUMP redesign pre-flight] min_foot_clearance sample (env 0, "
+                f"first step, should be idle/standing): {self.min_foot_clearance[0].item():.4f}m "
+                f"-- expect ~0.02-0.03m (MuJoCo-verified residual). If this is NOT "
+                f"in that range, FOOT_GEOM_LOCAL_OFFSET needs re-deriving against "
+                f"a live IsaacLab env, not just the MuJoCo bench -- stop and check."
+            )
+            self._clearance_calibration_printed = True
 
         self.had_flight = self.had_flight | (
             self.window_active & all_airborne & (self.min_foot_clearance > FLIGHT_CLEARANCE_EPS)
@@ -453,7 +477,17 @@ JUMP_LANDING_STILL_SIGMA = 0.5
 # true ground level -- NOT a height target itself (that's JUMP_TASK_MAX_
 # HEIGHT_TARGET below). Same order of magnitude as the noise floor other
 # contact-based terms in this file already tolerate.
-FLIGHT_CLEARANCE_EPS = 0.03  # m
+#
+# 0.03 -> 0.05 (base's review, same night): MuJoCo-side calibration found
+# ~0.027m residual clearance at plain standing (normal contact-solver
+# settle on the foot's spherical collision geom, not a bug) -- 0.03 left
+# only a 3mm margin above that noise floor, itself a manipulable-anchor
+# risk of the same class this whole redesign exists to eliminate. 0.05
+# gives ~1.85x margin over the observed residual and is still well below
+# the first ladder rung (10cm), so it doesn't cost any discrimination
+# power. Contact-based AND (had_flight already requires all_airborne)
+# independently guards against standing-jitter false-arms regardless.
+FLIGHT_CLEARANCE_EPS = 0.05  # m
 
 # Named 2026-08-19 (v7, cycle_peak_height's own init-clamp fix) -- was already
 # a bare 0.53 literal at jump_landing_height_stance/jump_idle_height's own
