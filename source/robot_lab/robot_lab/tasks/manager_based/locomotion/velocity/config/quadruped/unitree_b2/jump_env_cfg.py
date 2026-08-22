@@ -1219,9 +1219,45 @@ class UnitreeB2JumpRoughEnvCfg(UnitreeB2RoughEnvCfg):
         # own 0.35->0.30 note: with the stomping wind-up priced away, the pure
         # vertical push needs a steeper gradient to beat the stand-through-the-
         # window optimum from a standstill).
+        # 10.0 -> 14.0 (2026-08-22, post-leg_lift methodology transfer): dense
+        # checkpoint sweep on the v7a3 tail (it55000-64999, step ~100-1000)
+        # found peak airborne base_z hovering RIGHT at MIN_FLIGHT_BASE_HEIGHT
+        # (0.535) with checkpoint-to-checkpoint noise flipping PASS/FAIL every
+        # ~200-300 iterations -- confirmed real (bit-identical repeats on a
+        # deterministic bench) and confirmed NOT a training-dynamics glitch
+        # (Loss/entropy, Loss/learning_rate, Loss/value_function, and every
+        # Episode_Reward/* scalar are flat/noisy across the whole tail with no
+        # signature). Actuator torque checked directly against the bench's
+        # own model.actuator_ctrlrange (200/200/300 Nm hip/thigh/calf) on
+        # it63500's launch phase: peak 83.3% of cap (RR_thigh), 0.0% of steps
+        # within 1% of saturation on any of the 12 joints -- the ceiling is
+        # reward-shaped, not physical. Measured peak v_z at launch directly:
+        # 1.30 m/s, only 43% of this term's own clamp(0,3.0) -- vertical_launch
+        # itself is far from saturated either. Ballistics (Δh = (v2²-v1²)/2g)
+        # says reaching v_z~1.51 (+16%) buys ~3cm of extra peak height, a
+        # comfortable margin over the 0.535 threshold instead of sitting
+        # exactly on it. jump_task_max_height (weight 25, already the file's
+        # largest single term) was considered instead but rejected: it's paid
+        # ONCE per cycle at landing_edge (sparse) vs vertical_launch's every-
+        # launch-step density, and its own target (JUMP_TASK_MAX_HEIGHT_TARGET
+        # =0.85) is explicitly marked "FIRST GUESS...expect postmortem-driven
+        # revision" in its own comment -- changing two unverified numbers at
+        # once (an untested target AND its weight) isn't an isolated
+        # experiment. +40% (not a multiplier) per the leg_lift lesson that a
+        # single well-aimed step, not a large jump, produced a clean
+        # qualitative fix rather than an uncontrolled one. Resume from
+        # it63500 (best-margin checkpoint of the noisy tail, NOT claimed
+        # "safe" -- see TRAINING_STATE.md 2026-08-22) with --no_resume_optimizer
+        # (this file's own weight change invalidates the old Adam statistics
+        # tuned for weight=10.0's gradient scale). Budget ~1500-2000 it to see
+        # trend before committing more. Gate: dense checkpoint sweep (not one
+        # point) AND the same 4 landing metrics that are currently clean
+        # (impact/settle/bounce/drift) -- a height win that quietly breaks
+        # landing is the same "one fix, new symptom" pattern leg_lift's
+        # jerkiness co-symptom already taught this lab once.
         self.rewards.jump_vertical_launch = RewTerm(
             func=jump_vertical_launch,
-            weight=10.0,
+            weight=14.0,
             params={"command_name": "base_velocity"},
         )
         self.rewards.jump_direction_velocity = RewTerm(
