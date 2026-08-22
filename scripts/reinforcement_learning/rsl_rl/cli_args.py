@@ -33,6 +33,19 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser):
     arg_group.add_argument("--resume", action="store_true", default=False, help="Whether to resume from a checkpoint.")
     arg_group.add_argument("--load_run", type=str, default=None, help="Name of the run folder to resume from.")
     arg_group.add_argument("--checkpoint", type=str, default=None, help="Checkpoint file to resume from.")
+    # 2026-08-21, LegLift Stage 0->1 warm-start (see leg_lift_env_cfg.py's own
+    # Stage 1 comment): a cross-task/cross-reward-economy resume carries over
+    # Adam's optimizer moments tuned for the DONOR's loss landscape, which are
+    # actively wrong once the new task's reward composition changes (base's
+    # diagnosis of why v9.4's direct full-economy warm-start broke standing
+    # within 100 iterations). Weights-only load sidesteps this; the policy's
+    # learned behavior transfers, the optimizer starts clean for the new task.
+    arg_group.add_argument(
+        "--no_resume_optimizer",
+        action="store_true",
+        default=False,
+        help="With --resume, load only the policy weights (not the Adam optimizer state) from the checkpoint.",
+    )
     # -- logger arguments
     arg_group.add_argument(
         "--logger", type=str, default=None, choices={"wandb", "tensorboard", "neptune"}, help="Logger module to use."

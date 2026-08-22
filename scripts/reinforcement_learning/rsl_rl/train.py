@@ -150,7 +150,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
-        runner.load(resume_path)
+        # --no_resume_optimizer (see cli_args.py's own comment): cross-task/
+        # cross-economy warm-starts (e.g. LegLift Stage 0 -> Stage 1) want the
+        # donor's weights but NOT its Adam optimizer moments, which are tuned
+        # for a different reward landscape.
+        runner.load(resume_path, load_optimizer=not args_cli.no_resume_optimizer)
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
