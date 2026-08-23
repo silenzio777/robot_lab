@@ -585,15 +585,21 @@ STANDING_TARGET_HEIGHT = 0.53
 # file's own existing convention of hand-tuned weight steps, not automatic
 # curricula). Retarget this constant to the NEXT rung once a run clears the
 # current one -- do not leave stale between rungs.
-JUMP_TASK_MAX_HEIGHT_TARGET = 0.20
-# 0.08 -> 0.02 (same redesign): must stay a LIVE gradient at clearance=0 (a
-# fresh/early checkpoint's honest starting point) -- verified numerically
-# before launch: exp(-(0-0.20)**2/0.02) = exp(-2.0) = 0.135, comfortably
-# above the "not vanishing" floor (>=0.02) base's review required. Sharper
-# than the old 0.08 because the new target (0.20m) is a much smaller
-# absolute scale than the old one (0.85m) -- keeping the OLD sigma here
-# would have made the kernel too flat to discriminate progress within the
-# ladder's own 10-60cm range.
+# 0.20 -> 0.35 (2026-08-23 night, planned ladder step -- the 0.20 rung was
+# cleared with margin: model_75996's honest peak clearance is ~0.22m,
+# already past the OLD target, so leaving the constant at 0.20 would pay
+# near-max for standing still on this rung instead of climbing toward the
+# next one -- same "do not leave stale between rungs" discipline this
+# constant's own header comment already commits to.
+JUMP_TASK_MAX_HEIGHT_TARGET = 0.35
+# Sigma re-verified numerically at the new target before launch (base's
+# review requirement, same as the original 0.20 rung): current achieved
+# clearance ~0.22m gives exp(-(0.22-0.35)**2/0.02) = exp(-0.845) = 0.43,
+# comfortably live. Even at the worst case this run must not regress below
+# (the 0.10m first-rung floor, per the gate's own requirement not to fall
+# back under it): exp(-(0.10-0.35)**2/0.02) = exp(-3.125) = 0.044 -- still
+# well above the "not vanishing" floor (>=0.02), no sigma widening needed
+# for this step.
 JUMP_TASK_MAX_HEIGHT_SIGMA = 0.02
 
 # CALF_TUCK_TARGET / TUCK_SIGMA / jump_airborne_leg_tuck -- ADDED then
@@ -742,6 +748,12 @@ def jump_vertical_launch(env, command_name: str) -> torch.Tensor:
     return min_hip_v_z.clamp(0.0, 3.0) * in_launch.float()
 
 
+# sin(20deg)^2 -- see jump_rear_feet_liftoff's own "DIVE-PROOFED" comment.
+# Same +-20deg bound check_jump_liftoff_quality.py's vendor-reference gate
+# already enforces; not a fresh calibration.
+REAR_LIFTOFF_LEVEL_TILT_SQ = 0.1170
+
+
 def jump_rear_feet_liftoff(env, command_name: str) -> torch.Tensor:
     """IGNITION SCAFFOLD (2026-08-23 night, base's design, added after the
     first redesign trial's gate came back FAIL): a targeted dense term aimed
@@ -790,12 +802,38 @@ def jump_rear_feet_liftoff(env, command_name: str) -> torch.Tensor:
     fixture -- once real jumps ignite, revisit whether this should shrink or
     drop out (the same sigma-relaxation idiom Atanassov's own curriculum
     terms use), so a later cleanup pass doesn't mistake it for a
-    permanent design choice."""
+    permanent design choice.
+
+    2026-08-23 night, DIVE-PROOFED (base's postmortem on model_75996):
+    once real 4-leg flight ignited, the policy found a SECOND income
+    source hiding in this term's own gate -- pitching the body nose-down
+    swings the rear feet up via rotation, not a real vertical push, and
+    still satisfies front_airborne (front reaches the ground early in the
+    dive) while paying full rear_clearance. Confirmed via 4 independent
+    discriminators (TRAINING_STATE.md 2026-08-23 ~10:50): pitch profile
+    monotonic to touchdown (no return-to-level), landing distance/drift
+    both degraded, mosaic shows a visible dive, jump_launch_attitude's own
+    penalty grew ~30x over the run (bought, not avoided). Fix: gate this
+    term's payout on the SAME near-level quantity jump_launch_attitude
+    already prices (`projected_gravity_b` xy, not a new invented anchor)
+    -- rear-clearance now pays ONLY at vendor-reference form (level body +
+    rear airborne, reference video frame 3), not via any pitch-assisted
+    shortcut. Does not threaten ignition: the sparse terms (jump_task_
+    max_height/jumping_bonus) are already self-sustaining per their own
+    growing trend, and level jumps keep earning this term's credit
+    normally -- only the dive-specific income is removed."""
     term = env.command_manager.get_term(command_name)
+    asset = env.scene["robot"]
     front_airborne = ~term.contacts[:, 0:2].any(dim=1)  # FL, FR both off the ground
     rear_clearance = term.foot_clearance[:, 2:4].clamp(0.0, 0.3).mean(dim=1)  # RL, RR
     post_crouch = term.window_active & (term.phase >= CROUCH_PHASE_END)
-    return rear_clearance * front_airborne.float() * post_crouch.float()
+    # Same quantity jump_launch_attitude prices -- near-level gate, not a
+    # new anchor. REAR_LIFTOFF_LEVEL_TILT_SQ = sin(20deg)^2, the same
+    # +-20deg bound the vendor-reference gate (check_jump_liftoff_quality.py)
+    # already enforces at the clearance peak.
+    g_xy = asset.data.projected_gravity_b[:, 0:2]
+    level = (torch.sum(torch.square(g_xy), dim=1) < REAR_LIFTOFF_LEVEL_TILT_SQ).float()
+    return rear_clearance * front_airborne.float() * post_crouch.float() * level
 
 
 def jump_crouch(env, command_name: str) -> torch.Tensor:
@@ -1490,9 +1528,19 @@ class UnitreeB2JumpRoughEnvCfg(UnitreeB2RoughEnvCfg):
         # lands barely on balance -- see jump_launch_attitude's own docstring).
         # Moderate weight: a jump needs SOME pitch freedom, this prices only
         # the gross tilt that made landings marginal.
+        # -2.0 -> -6.0 (2026-08-23 night, base's postmortem on model_75996's
+        # dive): at -2.0 this term was outbid by jump_task_max_height, which
+        # pays near-max for a dive's OWN genuine (not faked) peak clearance --
+        # closing only the jump_rear_feet_liftoff income source (see that
+        # term's "DIVE-PROOFED" comment) left this second one open. Physics
+        # argument for the size of the jump, not just its direction: angular
+        # momentum is conserved in flight, so avoiding a pitched touchdown
+        # means not banking the rotation into the push in the first place --
+        # the penalty gradient during flight/landing has to be big enough to
+        # flow back into launch-phase symmetry, not just get paid past.
         self.rewards.jump_launch_attitude = RewTerm(
             func=jump_launch_attitude,
-            weight=-2.0,
+            weight=-6.0,
             params={"command_name": "base_velocity"},
         )
         self.rewards.jump_landing_impact = RewTerm(
