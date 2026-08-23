@@ -628,11 +628,23 @@ STANDING_TARGET_HEIGHT = 0.53
 # class of problem as the original 2026-08-04 bootstrap issue). NOT a
 # reviewed base decision -- flagged explicitly in the design-review message
 # for correction if this reasoning is wrong.
-JUMP_TASK_MAX_HEIGHT_TARGET = 0.20
-# Sigma unchanged (0.02) -- re-verified at the reset target: exp(-(0-0.20)**2
-# /0.02) = exp(-2.0) = 0.135 at the honest zero-clearance starting point,
-# comfortably live (same verification the ORIGINAL 0.20 rung launch did,
-# 2026-08-23 night comment history above).
+# 0.20 -> 0.35 (2026-08-23 afternoon, JUMP v9 second ladder step, base
+# reviewed): the 0.20 rung genuinely cleared, not a lucky single point --
+# a 3-checkpoint sweep (model_18900/19000/19099, step ~100-200it) gave
+# 0.1976/0.1980/0.2034m, mean=0.1997 std=0.0026 range=0.0058 -- tight,
+# monotonic (not oscillating), pitch small throughout (-1.6..-1.9deg).
+# Full JUMP_V8_REFERENCE_SPEC.md gate also passed on model_19099 (phase
+# 0-1 not degraded, landing package clean, full 0->6 mosaic honest --
+# TRAINING_STATE.md 2026-08-23 ~18:05). Same "do not leave stale between
+# rungs" discipline this constant's own header commits to.
+JUMP_TASK_MAX_HEIGHT_TARGET = 0.35
+# Sigma unchanged (0.02) -- re-verified numerically at the new target
+# before launch (base's review requirement, same as every prior rung):
+# exp(-(0.2034-0.35)**2/0.02) = exp(-1.075) = 0.341 at the current
+# achieved clearance -- comfortably live. Even at the worst case this
+# run must not regress below (the 0.10m first-rung floor):
+# exp(-(0.10-0.35)**2/0.02) = exp(-3.125) = 0.044 -- still well above
+# the "not vanishing" floor (>=0.02), no sigma widening needed.
 JUMP_TASK_MAX_HEIGHT_SIGMA = 0.02
 
 # CALF_TUCK_TARGET / TUCK_SIGMA / jump_airborne_leg_tuck -- ADDED then
