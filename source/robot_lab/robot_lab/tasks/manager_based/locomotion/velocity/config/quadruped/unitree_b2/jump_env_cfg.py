@@ -170,21 +170,14 @@ class JumpPulseCommand(CommandTerm):
         # computed once per step in _update_command, read by every reward
         # function that used to read root_pos_w for "how high is the jump".
         self.min_foot_clearance = torch.zeros(n, device=self.device)
-        # 2026-08-23 night, base's review: MANDATORY pre-flight sanity check
-        # for the very first live IsaacLab run under this redesign -- the
-        # FOOT_GEOM_LOCAL_OFFSET/sphere-radius calibration above was only
-        # verified against the MuJoCo bench (~0.027m standing residual,
-        # train had no live IsaacLab env available to cross-check against --
-        # WALK training held the only GPU that night). Prints
-        # min_foot_clearance's own standing value ONCE, on this run's first
-        # _update_command call, so it's visible in the training log without
-        # extra tooling. If IsaacLab's own calf-body frame convention
-        # differs from the MuJoCo bench in any way, this number will NOT
-        # land near ~0.02-0.03m -- STOP and re-derive FOOT_GEOM_LOCAL_OFFSET
-        # against a live env before trusting anything downstream of
-        # min_foot_clearance (every height/flight-detection term in this
-        # redesign).
+        # 2026-08-23 night, base's design: PERMANENT self-validating sanity
+        # check (not a one-off manual verification) -- see the full
+        # rationale at its own print site in _update_command. Fires ONCE,
+        # the first time the contact sensor independently confirms all 4
+        # feet are on the ground (ground truth), not on a fixed elapsed-
+        # time guess.
         self._clearance_calibration_printed = False
+        self._clearance_warmup_steps = 0
 
     @property
     def command(self) -> torch.Tensor:
@@ -275,13 +268,42 @@ class JumpPulseCommand(CommandTerm):
         ).reshape(n_envs, 4, 3)
         foot_pos_w = calf_pos_w + world_offset
         self.min_foot_clearance = foot_pos_w[:, :, 2].min(dim=1).values
-        if not self._clearance_calibration_printed:
+        # 2026-08-23 night, base's design: PERMANENT self-validating sanity
+        # check, not a one-off debug print -- the entire redesign's economy
+        # (A1-A3, jump_task_max_height, had_flight, jump_flight/jump_flight_
+        # distance) now depends on this FK being correct, so every run
+        # checks itself instead of trusting a one-time manual verification.
+        # Self-validates against the CONTACT SENSOR (independent ground
+        # truth "feet ARE on the floor"), not against elapsed time -- an
+        # earlier version gated on "first _update_command call ever" and
+        # falsely looked broken (0.5135m instead of ~0.02-0.03m) because it
+        # sampled during randomize_reset_base's own random-orientation
+        # spawn-fall, before physics had time to settle; almost-identical
+        # quaternions across all 4 calf bodies (one shared large rotation,
+        # not 4 independent standing poses) plus a 0.68m spread in calf
+        # heights confirmed that diagnosis, not an FK bug. Waiting for the
+        # contact sensor to independently confirm all 4 feet down removes
+        # any "did it settle yet" ambiguity -- if min_foot_clearance is NOT
+        # near 0 at the exact moment ground truth says all 4 feet ARE on
+        # the ground, that is unambiguously an FK bug, not a timing
+        # artifact. `_clearance_warmup_steps` skips a few steps after
+        # process start purely to avoid a coincidental spawn-frame
+        # contact-sensor false-positive before the very first physics
+        # settle tick.
+        self._clearance_warmup_steps += 1
+        if (
+            not self._clearance_calibration_printed
+            and self._clearance_warmup_steps > 10
+            and bool(in_contact[0].all())
+        ):
+            ok = 0.0 <= self.min_foot_clearance[0].item() <= 0.10
             print(
-                f"[JUMP redesign pre-flight] min_foot_clearance sample (env 0, "
-                f"first step, should be idle/standing): {self.min_foot_clearance[0].item():.4f}m "
-                f"-- expect ~0.02-0.03m (MuJoCo-verified residual). If this is NOT "
-                f"in that range, FOOT_GEOM_LOCAL_OFFSET needs re-deriving against "
-                f"a live IsaacLab env, not just the MuJoCo bench -- stop and check."
+                f"[JUMP self-check] min_foot_clearance (env 0, contact sensor confirms "
+                f"all 4 feet down): {self.min_foot_clearance[0].item():.4f}m -- expect "
+                f"~0.02-0.03m (MuJoCo-verified residual). "
+                + ("OK." if ok else "MISMATCH -- FOOT_GEOM_LOCAL_OFFSET or calf-body frame "
+                   "assumption is WRONG for this env, do not trust min_foot_clearance-based "
+                   "rewards until re-derived.")
             )
             self._clearance_calibration_printed = True
 
