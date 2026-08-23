@@ -128,17 +128,23 @@ class JumpPulseCommand(CommandTerm):
         # needs per-leg (front vs rear) contact state, unlike every existing
         # consumer of `self.contacts` (jump_launch_attitude/jump_landing_pose),
         # which only ever call `.any(dim=1)` and never cared about column order.
-        # `_feet_sensor_cfg.body_ids` is populated by find_bodies() on a regex
-        # match -- its order is NOT contractually guaranteed to equal the
-        # explicit FL/FR/RL/RR order `self._calf_body_ids` uses (that one is
-        # built by name, not regex). Resolving this mapping BY NAME once here
-        # removes the assumption instead of trusting the two orderings happen
-        # to coincide.
-        sensor_names = self._feet_sensor_cfg.body_names
-        self._feet_sensor_order = torch.tensor(
-            [sensor_names.index(n) for n in ("FL_calf", "FR_calf", "RL_calf", "RR_calf")],
-            device=self.device,
+        # FIRST ATTEMPT crashed loudly at env creation (ValueError: 'FL_calf'
+        # is not in list) -- `SceneEntityCfg.resolve()` does NOT rewrite its
+        # own `.body_names` field to the matched names after a regex match;
+        # it stays the literal pattern string ('.*_calf'), only `.body_ids`
+        # gets updated (see isaaclab/managers/scene_entity_cfg.py's own
+        # `_resolve_body_names`: `self.body_ids, _ = entity.find_bodies(...)`
+        # discards the second return value, which IS the matched-names list).
+        # Fix: call `find_bodies` directly on the sensor entity with
+        # `preserve_order=True` -- this returns ids already in the QUERY's
+        # own order (FL,FR,RL,RR), matching `self._calf_body_ids`/
+        # `min_foot_clearance`'s order by construction, no separate by-name
+        # cross-reference needed.
+        contact_sensor_entity = self._env.scene[self._feet_sensor_cfg.name]
+        feet_sensor_order, _ = contact_sensor_entity.find_bodies(
+            ("FL_calf", "FR_calf", "RL_calf", "RR_calf"), preserve_order=True
         )
+        self._feet_sensor_order = torch.tensor(feet_sensor_order, device=self.device)
         # Per-foot (not just min-across-4) ground clearance, same FL/FR/RL/RR
         # order as self.contacts post-reorder and self._calf_body_ids -- lets
         # jump_rear_feet_liftoff read the REAR PAIR specifically instead of
@@ -262,13 +268,14 @@ class JumpPulseCommand(CommandTerm):
         # and FLIGHT_CLEARANCE_EPS's own module-level comment for why root-Z
         # was replaced here (2026-08-23 night, rearing exploit fix).
         contact_sensor = self._env.scene.sensors[self._feet_sensor_cfg.name]
-        in_contact = contact_sensor.data.current_contact_time[:, self._feet_sensor_cfg.body_ids] > 0.0
-        # Reorder to canonical FL/FR/RL/RR via the by-name mapping resolved in
-        # __init__ (see self._feet_sensor_order's own comment) -- every
-        # existing reader of self.contacts is order-agnostic (`.any(dim=1)`),
-        # so this reorder cannot change any existing reward's value; it only
-        # makes the array safe for jump_rear_feet_liftoff's per-leg indexing.
-        in_contact = in_contact[:, self._feet_sensor_order]
+        # Indexed by self._feet_sensor_order (canonical FL/FR/RL/RR, resolved
+        # in __init__ via find_bodies(preserve_order=True) -- see its own
+        # comment), NOT self._feet_sensor_cfg.body_ids (regex-match order,
+        # unordered). Every existing reader of self.contacts is order-
+        # agnostic (`.any(dim=1)`), so this switch cannot change any existing
+        # reward's value; it only makes the array safe for
+        # jump_rear_feet_liftoff's per-leg indexing.
+        in_contact = contact_sensor.data.current_contact_time[:, self._feet_sensor_order] > 0.0
         self.contacts = in_contact
         # v7: per-step contact-state churn, for jump_change_of_contact below --
         # Atanassov's own change_of_contact, computed once here (not inside the
