@@ -106,6 +106,26 @@ class JumpPulseCommand(CommandTerm):
         # jump_task_max_height's own docstring for the full adaptation note).
         self._prev_landing_active = torch.zeros(n, dtype=torch.bool, device=self.device)
         self.landing_edge = torch.zeros(n, dtype=torch.bool, device=self.device)
+        # 2026-08-23 evening, JUMP v9 crouch-turnaround fix (owner's direct
+        # order, base's design): SAME edge-detection idiom as landing_edge
+        # above, applied to the crouch->launch phase boundary instead of the
+        # flight->landing one. Root cause diagnosed this morning (live
+        # step-by-step trace + actuator-limit check, TRAINING_STATE.md
+        # 2026-08-23 ~14-15h): the policy reverses out of the crouch fold at
+        # ~73% of the crouch window, well before CROUCH_PHASE_END, NOT
+        # because of an actuator ceiling (measured joint speed only ~14% of
+        # rated) or a competing reward term (jump_body_level_crouch/
+        # jump_crouch_feet_planted both checked numerically, neither spikes
+        # at the reversal point) -- a value-function/temporal-credit effect:
+        # jump_crouch's OWN dense per-step penalty is smeared across the
+        # whole crouch window, so the marginal cost of leaving the fold a
+        # few steps early (to bank the upcoming launch-phase reward sooner)
+        # is small relative to the cost paid over the window as a whole.
+        # This edge flag lets a NEW term price depth AT EXACTLY the moment
+        # the window closes, concentrating pressure where the dense term
+        # can't.
+        self._prev_in_crouch = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.crouch_transition_edge = torch.zeros(n, dtype=torch.bool, device=self.device)
         # Peak world-Z reached so far THIS CYCLE -- the episodic max_height
         # analog. Reset to the current (near-standing, since a fresh cycle always
         # starts in idle) height at each resample, same "reset to standing
@@ -228,6 +248,8 @@ class JumpPulseCommand(CommandTerm):
         self.had_flight[env_ids] = False
         self._prev_landing_active[env_ids] = False
         self.landing_edge[env_ids] = False
+        self._prev_in_crouch[env_ids] = False
+        self.crouch_transition_edge[env_ids] = False
         # v7 fix (2026-08-19, claude-tg-base's review, caught before launch):
         # clamped to STANDING_TARGET_HEIGHT, not the raw live root z. This
         # _resample_command call also fires on a fresh EPISODE reset (see
@@ -400,6 +422,14 @@ class JumpPulseCommand(CommandTerm):
         self._command[:, 0:2] = self.direction * active
         self._command[:, 2] = self.phase
 
+        # 2026-08-23 evening, crouch-turnaround fix: same rising-edge idiom
+        # as landing_edge above, at the crouch->launch boundary instead --
+        # see self.crouch_transition_edge's own __init__ comment for the
+        # full diagnosis this addresses.
+        in_crouch = self.window_active & (self.phase < CROUCH_PHASE_END)
+        self.crouch_transition_edge = self._prev_in_crouch & ~in_crouch
+        self._prev_in_crouch = in_crouch.clone()
+
         # v7d fix: capture yaw ONCE, the first step this cycle where the
         # launch phase has begun -- see launch_yaw's own __init__ comment.
         entering_launch = self.window_active & (self.phase >= CROUCH_PHASE_END) & ~self._launch_yaw_captured
@@ -477,6 +507,47 @@ CROUCH_PHASE_END = 0.35
 # vertical_launch 8->10 below. Applied under the user's standing grant
 # ("останавливать, изменять, запускать по новой -- можешь сам").)
 CROUCH_TARGET_HEIGHT = 0.30  # base height at the bottom of the soft pre-jump bend
+# FK sanity-check (2026-08-23 evening, base's ask: verify by computation, not
+# leave a guess untested). 2-link planar chain in the sagittal plane, hip-
+# roll ignored (hip/thigh joint origins carry z=0 offset from base_link,
+# confirmed directly in b2_description.urdf -- base_z IS the hip-pitch-axis
+# height to good approximation): base_z = L_THIGH*cos(theta_t) +
+# L_CALF*cos(theta_t+theta_c), L_THIGH=0.35m (FL_calf_joint origin, URDF),
+# L_CALF=0.382m (foot COLLISION sphere center, matches FOOT_GEOM_LOCAL_
+# OFFSET already validated elsewhere in this file). Sanity-checked against
+# the MEASURED standing default (thigh=0.8, calf=-1.5): formula gives
+# 0.5360m, matches the live idle base_z (0.53-0.54m) this file's own
+# checkpoints have shown all night -- FK model confirmed correct, not
+# guessed.
+#
+# Raw URDF joint limits (thigh -0.94..4.69 rad, calf -2.82..-0.43 rad) admit
+# a mathematical minimum near base_z~0 or even negative -- but that optimum
+# sits at a degenerate, physically-unnatural leg fold (thigh swept far past
+# vertical), NOT the vendor reference's "belly to platform, level" crouch.
+# A single-joint change from standing (thigh held at 0.8, only calf folding
+# further toward its own -2.82 limit) reaches base_z=0.078m -- a much more
+# anatomically sensible "just bend the knee more" family of solutions.
+# 0.30m sits comfortably inside this sensible range (between the standing
+# 0.536m and the single-joint-fold floor of 0.078m), so NOT geometrically
+# unreachable -- kept unchanged pending base's read against the actual
+# reference frame 1 pose (this file's own FK check narrows the plausible
+# range, it does not by itself pick the exact number the vendor video
+# shows).
+CROUCH_TARGET_HEIGHT_SIGMA = 0.02  # verified numerically before launch, see
+# jump_crouch_depth_at_transition's own RewTerm registration comment below.
+#
+# OPEN ITEM (base's review, 2026-08-23 evening, not blocking this pass):
+# the single-joint-fold floor above (0.078m) only varies calf, holding
+# thigh fixed at its standing value -- a real "живот к платформе" deep
+# crouch folds BOTH joints together (thigh sweeps back too, not just the
+# knee). The TRUE two-parameter floor (thigh+calf jointly, within their
+# real limits, excluding the degenerate whole-leg-flip solution) is deeper
+# than 0.078m -- meaning 0.30 could still read as shallow relative to the
+# vendor reference's own crouch, even after this pass's fix. Deferred, not
+# solved: if depth still doesn't visually match reference frame 1 after
+# this trial, redo the FK check as a genuine 2D (thigh, calf) optimization
+# over a physically-sensible joint-angle region instead of the 1D
+# calf-only sweep this pass used.
 # v3->v4 (2026-08-16, owner bench verdict on 24999: "еле-еле прыгает", flight_distance
 # down ~30% vs the prior checkpoint 33399, 0.22->0.16, despite vertical_launch and
 # direction_velocity holding steady). Root cause traced to jump_airborne_front_leg_pose
@@ -891,6 +962,42 @@ def jump_crouch(env, command_name: str) -> torch.Tensor:
     in_crouch = term.window_active & (term.phase < CROUCH_PHASE_END)
     err = torch.square(asset.data.root_pos_w[:, 2] - CROUCH_TARGET_HEIGHT)
     return err * in_crouch.float()
+
+
+def jump_crouch_depth_at_transition(env, command_name: str) -> torch.Tensor:
+    """Sparse, positive, paid ONCE per cycle at `term.crouch_transition_edge`
+    (2026-08-23 evening, owner's direct order + base's design, after the
+    owner rejected model_24500 for not matching vendor phase 1, "присела
+    полностью"): a targeted fix for a specific, already-diagnosed mechanism,
+    not a blind weight bump.
+
+    Root cause (live step-by-step trace + actuator-limit check, TRAINING_
+    STATE.md 2026-08-23 morning): the policy reverses out of the crouch fold
+    at ~73% of the crouch window, well before the phase boundary, despite
+    (a) joints measured at only ~14% of their rated speed (no actuator
+    ceiling), (b) jump_body_level_crouch/jump_crouch_feet_planted BOTH
+    checked numerically and neither spikes at the reversal point (no
+    reward-term conflict). Diagnosis: `jump_crouch` (dense, -8.0, this
+    function above) smears its penalty evenly across the whole crouch
+    window -- the marginal cost of banking the launch-phase reward a few
+    steps early is small relative to the cost paid over the window as a
+    whole, so the policy trades a little of the tail-end depth for an
+    earlier start on launch credit. A DENSE term averaged over time cannot
+    concentrate pressure on "be low specifically AT THE MOMENT the window
+    ends" -- only a term keyed to that exact instant can.
+
+    This term does exactly that: exp-anchor of root height to
+    CROUCH_TARGET_HEIGHT, evaluated ONLY on the single step the crouch
+    window closes (mirrors jump_task_max_height's own landing_edge idiom --
+    same sparse-edge-bonus shape, different edge). jump_crouch itself is
+    UNCHANGED (one architectural variable this pass, not a bundle) --
+    together the two terms price BOTH "stay reasonably low throughout" and
+    "be at your deepest specifically when it counts", closing the exact gap
+    the diagnosis found."""
+    term = env.command_manager.get_term(command_name)
+    asset = env.scene["robot"]
+    err = torch.square(asset.data.root_pos_w[:, 2] - CROUCH_TARGET_HEIGHT)
+    return torch.exp(-err / CROUCH_TARGET_HEIGHT_SIGMA) * term.crouch_transition_edge.float()
 
 
 def jump_crouch_feet_planted(env, command_name: str, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
@@ -1584,6 +1691,32 @@ class UnitreeB2JumpRoughEnvCfg(UnitreeB2RoughEnvCfg):
         self.rewards.jump_crouch = RewTerm(
             func=jump_crouch,
             weight=-8.0,
+            params={"command_name": "base_velocity"},
+        )
+        # New 2026-08-23 evening (owner's direct order + base's design --
+        # see jump_crouch_depth_at_transition's own docstring for the full
+        # diagnosis). jump_crouch itself (above) deliberately UNCHANGED --
+        # one architectural variable this pass. Weight 10.0 -> 18.0 (base's
+        # review): both this term and jump_task_max_height are the SAME
+        # architectural pattern (sparse, paid once at an edge, max payout =
+        # weight*1.0) -- the right comparison is sparse-vs-sparse, not
+        # sparse-vs-the-dense-8.0-crouch-term. jump_task_max_height at 25.0
+        # is exactly the "anticipation" pull this fix is meant to counter;
+        # at weight 10 this term could offer at most 40% of that pull,
+        # possibly not enough to move the reversal point. 18.0 (72% of 25)
+        # is a significant but not extreme first step -- same "one
+        # moderate step, not a leap to the max" discipline as every other
+        # weight change tonight; escalate further only if the trial shows
+        # it's still not enough, not guessed to 25 up front. Sigma (0.02)
+        # verified numerically before launch: exp(-(0.4411-0.30)**2/0.02)
+        # =0.370 at the CURRENT (pre-fix) achieved depth -- already live,
+        # not starting from zero; exp(-(0.35-0.30)**2/0.02)=0.883 if the
+        # gate criterion (min root_z<=0.35) is met -- strong, discriminating
+        # signal; exp(-(0.53-0.30)**2/0.02)=0.071 even in the worst case
+        # (no crouch at all, idle height) -- still live, not vanishing.
+        self.rewards.jump_crouch_depth_at_transition = RewTerm(
+            func=jump_crouch_depth_at_transition,
+            weight=18.0,
             params={"command_name": "base_velocity"},
         )
         # New 2026-08-12 (bench on 34999: stomping/splaying/re-stepping during
