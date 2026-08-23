@@ -124,6 +124,26 @@ class JumpPulseCommand(CommandTerm):
         self._prev_contacts = torch.zeros(n, 4, dtype=torch.bool, device=self.device)
         self.contacts = torch.zeros(n, 4, dtype=torch.bool, device=self.device)
         self.contact_diff = torch.zeros(n, device=self.device)
+        # 2026-08-23 night, jump_rear_feet_liftoff ignition scaffold: that term
+        # needs per-leg (front vs rear) contact state, unlike every existing
+        # consumer of `self.contacts` (jump_launch_attitude/jump_landing_pose),
+        # which only ever call `.any(dim=1)` and never cared about column order.
+        # `_feet_sensor_cfg.body_ids` is populated by find_bodies() on a regex
+        # match -- its order is NOT contractually guaranteed to equal the
+        # explicit FL/FR/RL/RR order `self._calf_body_ids` uses (that one is
+        # built by name, not regex). Resolving this mapping BY NAME once here
+        # removes the assumption instead of trusting the two orderings happen
+        # to coincide.
+        sensor_names = self._feet_sensor_cfg.body_names
+        self._feet_sensor_order = torch.tensor(
+            [sensor_names.index(n) for n in ("FL_calf", "FR_calf", "RL_calf", "RR_calf")],
+            device=self.device,
+        )
+        # Per-foot (not just min-across-4) ground clearance, same FL/FR/RL/RR
+        # order as self.contacts post-reorder and self._calf_body_ids -- lets
+        # jump_rear_feet_liftoff read the REAR PAIR specifically instead of
+        # only the aggregate min_foot_clearance.
+        self.foot_clearance = torch.zeros(n, 4, device=self.device)
 
         # v7d postmortem fix (2026-08-22, base's diagnosis, confirmed by code +
         # a direct yaw-drift-vs-lateral-drift correlation measurement --
@@ -243,6 +263,12 @@ class JumpPulseCommand(CommandTerm):
         # was replaced here (2026-08-23 night, rearing exploit fix).
         contact_sensor = self._env.scene.sensors[self._feet_sensor_cfg.name]
         in_contact = contact_sensor.data.current_contact_time[:, self._feet_sensor_cfg.body_ids] > 0.0
+        # Reorder to canonical FL/FR/RL/RR via the by-name mapping resolved in
+        # __init__ (see self._feet_sensor_order's own comment) -- every
+        # existing reader of self.contacts is order-agnostic (`.any(dim=1)`),
+        # so this reorder cannot change any existing reward's value; it only
+        # makes the array safe for jump_rear_feet_liftoff's per-leg indexing.
+        in_contact = in_contact[:, self._feet_sensor_order]
         self.contacts = in_contact
         # v7: per-step contact-state churn, for jump_change_of_contact below --
         # Atanassov's own change_of_contact, computed once here (not inside the
@@ -267,7 +293,8 @@ class JumpPulseCommand(CommandTerm):
             calf_quat_w.reshape(-1, 4), local_offset.reshape(-1, 3)
         ).reshape(n_envs, 4, 3)
         foot_pos_w = calf_pos_w + world_offset
-        self.min_foot_clearance = foot_pos_w[:, :, 2].min(dim=1).values
+        self.foot_clearance = foot_pos_w[:, :, 2]  # (n,4), FL/FR/RL/RR -- see its own __init__ comment
+        self.min_foot_clearance = self.foot_clearance.min(dim=1).values
         # 2026-08-23 night, base's design: PERMANENT self-validating sanity
         # check, not a one-off debug print -- the entire redesign's economy
         # (A1-A3, jump_task_max_height, had_flight, jump_flight/jump_flight_
@@ -706,6 +733,62 @@ def jump_vertical_launch(env, command_name: str) -> torch.Tensor:
     hip_v_z = asset.data.body_lin_vel_w[:, term._hip_body_ids, 2]  # (n,4)
     min_hip_v_z = hip_v_z.min(dim=1).values
     return min_hip_v_z.clamp(0.0, 3.0) * in_launch.float()
+
+
+def jump_rear_feet_liftoff(env, command_name: str) -> torch.Tensor:
+    """IGNITION SCAFFOLD (2026-08-23 night, base's design, added after the
+    first redesign trial's gate came back FAIL): a targeted dense term aimed
+    at the SPECIFIC hole the gate + mosaic diagnosed on model_67998 -- the
+    rear feet (RL/RR) still barely leave the ground (peak clearance
+    0.005-0.018m) even though the redesign successfully killed rearing as a
+    class (honest crouch, no 25-30deg pitch cheat) and the front feet lift
+    easily on their own (v7d already showed 0.31m of FRONT clearance).
+
+    Root cause (base's diagnosis, matches the 2026-08-04 flight-gate
+    bootstrap problem already on record in this file's own history, just one
+    level deeper): min-over-4-feet/min-over-4-hip credit sources
+    (jump_vertical_launch, jump_flight's gate, jump_task_max_height,
+    jump_task_jumping_bonus) all pay ZERO until a genuine 4-leg liftoff
+    happens -- and exploration starting from a rearing-biased checkpoint
+    doesn't stumble into that event on its own. 0 reward times any weight is
+    still 0; the fix is a NEW dense signal that pays for PARTIAL progress
+    toward the missing half of the motion, not a bigger multiplier on a term
+    that is currently zero.
+
+    Reward = mean rear-foot clearance (RL,RR), clamped to 0..0.3m so a full
+    real jump doesn't need this term to keep climbing once flight exists --
+    times a gate that closes every farming path:
+      - front_airborne (both FL AND FR off the ground, contact-sensor fact):
+        without this, "kick the rear feet up while the front stays planted"
+        (a mule-kick / handstand-adjacent shape, physically nothing like the
+        reference jump) would pay in full -- the reference video shows the
+        REAR launch happening once the front is already lifted, not before.
+      - window_active & post-crouch (same phase convention every other
+        launch-phase term in this file uses): excludes idle/crouch entirely,
+        so standing still or mid-fold cannot farm this either.
+    Rearing itself still pays 0 here (rear feet stay near 0 clearance by
+    definition of rearing), so this term cannot resurrect the exploit
+    self-check/check_jump_liftoff_quality.py already killed -- it only
+    rewards moving in exactly the direction the gate demands: front already
+    up, now lift the rear too. Partial credit (one rear foot half up) pays
+    half, unlike the min-across-4 gates this scaffolds around, which paid
+    nothing for the same partial progress -- the dense gradient this and
+    every other bootstrap term in this file (jump_vertical_launch's own
+    2026-08-04 history) exists to provide.
+
+    Same idiom as leg_lift_env_cfg.py's `support_contact` lesson, mirrored:
+    that term penalized the SUPPORTING leg lifting (an unwanted degree of
+    freedom); this one pays for exactly the leg PAIR diagnosed as not
+    lifting when it should. Marked explicitly as a SCAFFOLD, not a permanent
+    fixture -- once real jumps ignite, revisit whether this should shrink or
+    drop out (the same sigma-relaxation idiom Atanassov's own curriculum
+    terms use), so a later cleanup pass doesn't mistake it for a
+    permanent design choice."""
+    term = env.command_manager.get_term(command_name)
+    front_airborne = ~term.contacts[:, 0:2].any(dim=1)  # FL, FR both off the ground
+    rear_clearance = term.foot_clearance[:, 2:4].clamp(0.0, 0.3).mean(dim=1)  # RL, RR
+    post_crouch = term.window_active & (term.phase >= CROUCH_PHASE_END)
+    return rear_clearance * front_airborne.float() * post_crouch.float()
 
 
 def jump_crouch(env, command_name: str) -> torch.Tensor:
@@ -1507,6 +1590,22 @@ class UnitreeB2JumpRoughEnvCfg(UnitreeB2RoughEnvCfg):
         self.rewards.jump_vertical_launch = RewTerm(
             func=jump_vertical_launch,
             weight=14.0,
+            params={"command_name": "base_velocity"},
+        )
+        # 2026-08-23 night, base's design: ignition scaffold added after the
+        # first redesign trial's gate FAILED (model_67998: rear-foot peak
+        # clearance 0.005-0.018m vs 0.50m required -- see the function's own
+        # docstring for the full diagnosis). Weight 10.0 chosen to outbid
+        # `upward` (measured at 11.4 in the failed trial's own logs -- comfort
+        # of standing still must stop being the cheaper option) while staying
+        # below jump_vertical_launch (14.0), which should remain the dominant
+        # launch-phase signal once flight exists. --no_resume_optimizer
+        # required on the next launch (new term changes the reward economy
+        # materially, same reasoning as every other weight-change resume in
+        # this file's history).
+        self.rewards.jump_rear_feet_liftoff = RewTerm(
+            func=jump_rear_feet_liftoff,
+            weight=10.0,
             params={"command_name": "base_velocity"},
         )
         self.rewards.jump_direction_velocity = RewTerm(
