@@ -341,6 +341,29 @@ class JumpPulseCommand(CommandTerm):
             )
             self._clearance_calibration_printed = True
 
+        # 2026-08-23 morning, JUMP v9 restart (owner's direct order: "Срывай
+        # все и лечите с начала! Сидения НЕ должно быть!"): same
+        # consolidation-window idiom leg_lift_env_cfg.py's own v9.6 uses
+        # (STANDING_CONSOLIDATION_STEPS) -- below this env-step count, force
+        # every env to stay literally idle (no window/phase/command at all),
+        # not just a zeroed reward weight. From a fresh stage_a_standing
+        # resume the network needs time to re-stabilize under an entirely
+        # new reward economy before any jump cycle should be allowed to
+        # fire; letting the cycle run from step 0 risks the exact
+        # "unanchored form drifts wherever other rewards push it" failure
+        # this whole restart exists to fix. Physical measurements above
+        # (contacts, min_foot_clearance) keep running unconditionally --
+        # they are ground truth, not cycle state, and other always-on
+        # consumers (e.g. jump_change_of_contact) need them accurate even
+        # during consolidation.
+        if self._env.common_step_counter < JUMP_STANDING_CONSOLIDATION_STEPS:
+            self.window_active[:] = False
+            self.phase[:] = 0.0
+            self._command[:] = 0.0
+            self.had_flight[:] = False
+            self.landing_active[:] = False
+            return
+
         self.had_flight = self.had_flight | (
             self.window_active & all_airborne & (self.min_foot_clearance > FLIGHT_CLEARANCE_EPS)
         )
@@ -420,6 +443,16 @@ class JumpPulseCommandCfg(CommandTermCfg):
     directions: tuple = ((1.0, 0.0),)
     debug_vis: bool = False
 
+
+# 2026-08-23 morning, JUMP v9 restart: same consolidation-window idiom
+# leg_lift_env_cfg.py's own v9.6 (STANDING_CONSOLIDATION_STEPS) uses --
+# below this env-step count, JumpPulseCommand._update_command forces every
+# env to stay literally idle (see its own gate comment). it2000 chosen as
+# a starting point, base's explicit range ~1500-2000; num_steps_per_env=24
+# (this task's agents/rsl_rl_ppo_cfg.py, unchanged) -> 2000*24=48000.
+# env.common_step_counter units, same formula leg_lift_env_cfg.py's own
+# STANDING_CONSOLIDATION_STEPS comment derives its 50400 from.
+JUMP_STANDING_CONSOLIDATION_STEPS = 48000
 
 # 4-phase jump structure inside the 1.1s window (2026-08-05, modeled on how a real
 # Go2/B2 actually executes a jump, per the user's own frame-by-frame observation):
@@ -585,21 +618,21 @@ STANDING_TARGET_HEIGHT = 0.53
 # file's own existing convention of hand-tuned weight steps, not automatic
 # curricula). Retarget this constant to the NEXT rung once a run clears the
 # current one -- do not leave stale between rungs.
-# 0.20 -> 0.35 (2026-08-23 night, planned ladder step -- the 0.20 rung was
-# cleared with margin: model_75996's honest peak clearance is ~0.22m,
-# already past the OLD target, so leaving the constant at 0.20 would pay
-# near-max for standing still on this rung instead of climbing toward the
-# next one -- same "do not leave stale between rungs" discipline this
-# constant's own header comment already commits to.
-JUMP_TASK_MAX_HEIGHT_TARGET = 0.35
-# Sigma re-verified numerically at the new target before launch (base's
-# review requirement, same as the original 0.20 rung): current achieved
-# clearance ~0.22m gives exp(-(0.22-0.35)**2/0.02) = exp(-0.845) = 0.43,
-# comfortably live. Even at the worst case this run must not regress below
-# (the 0.10m first-rung floor, per the gate's own requirement not to fall
-# back under it): exp(-(0.10-0.35)**2/0.02) = exp(-3.125) = 0.044 -- still
-# well above the "not vanishing" floor (>=0.02), no sigma widening needed
-# for this step.
+# 0.35 -> 0.20 (2026-08-23 morning, JUMP v9 FULL RESTART, owner's direct
+# order): reset to the FIRST rung. The 0.35 target was earned progress
+# against the previous checkpoint chain (v7c->rear_feet_liftoff->dive-fix),
+# which this restart deliberately discards in favor of stage_a_standing --
+# a fresh standing-only donor has NOT cleared any rung yet, so leaving the
+# target at 0.35 would price a still-nonexistent jump against a target two
+# rungs ahead of where exploration actually starts (same ignition-gap
+# class of problem as the original 2026-08-04 bootstrap issue). NOT a
+# reviewed base decision -- flagged explicitly in the design-review message
+# for correction if this reasoning is wrong.
+JUMP_TASK_MAX_HEIGHT_TARGET = 0.20
+# Sigma unchanged (0.02) -- re-verified at the reset target: exp(-(0-0.20)**2
+# /0.02) = exp(-2.0) = 0.135 at the honest zero-clearance starting point,
+# comfortably live (same verification the ORIGINAL 0.20 rung launch did,
+# 2026-08-23 night comment history above).
 JUMP_TASK_MAX_HEIGHT_SIGMA = 0.02
 
 # CALF_TUCK_TARGET / TUCK_SIGMA / jump_airborne_leg_tuck -- ADDED then
@@ -879,48 +912,49 @@ def jump_crouch_feet_planted(env, command_name: str, sensor_cfg: SceneEntityCfg)
     return (off_ground + slip) * in_crouch.float()
 
 
-def jump_launch_attitude(env, command_name: str) -> torch.Tensor:
-    """Penalize roll/pitch (body tilting away from level) during flight and
-    landing (added 2026-08-12, bench verdict on 34999: the backward jump
-    lifts the rear high into the air -- "попу поднимает сильно" -- and
-    barely lands on balance). The inherited `upward` reward (3.0) prices this
-    too weakly against launch terms at 8: a hind-dominant push can buy a big
-    pitch-up cheaply. Squared world-frame roll+pitch rate is NOT used --
-    attitude itself is the problem, so price the gravity-projected tilt
-    directly (same quantity flat-orientation terms use everywhere else).
+def jump_body_level(env, command_name: str, phase: str) -> torch.Tensor:
+    """Penalize roll/pitch (body tilting away from level) -- registered TWICE
+    with different phase/weight (2026-08-23 morning, JUMP v9 restart,
+    base's design): ONE function, not two near-duplicates, since both
+    windows price the exact same physical quantity.
 
-    2026-08-23 night (base+train redesign): gate window NARROWED from "all
-    post-crouch" (launch push + flight + landing) to airborne-or-landing
-    ONLY -- excludes the launch push itself. Term-attribution on it67000
-    (TRAINING_STATE.md same date) found this term WAS already firing during
-    rearing (pitch -18.9 -> -35.75deg, penalty growing -0.22 -> -0.68) but
-    got outbid by the height/velocity credit that pitch could fake -- not a
-    gating problem, a magnitude-vs-jump_vertical_launch problem. Now that
-    jump_vertical_launch itself no longer credits rearing (min-over-4-hips
-    v_z collapses near zero when the rear hips stay low), a real rear-
-    dominant push's OWN transient pitch during the explosive launch instant
-    is safe to allow -- a real jump physically passes through some
-    momentary tilt during push-off; only flight/landing attitude matters
-    for a clean ballistic trajectory and a controlled touchdown."""
+    phase="crouch" -- vendor phase 1 ("присела полностью", corpus горизонтален
+    и низко): NEW this restart. Root cause of the "sitting on hind legs"
+    pathology traced one level deeper than idle (2026-08-23 morning,
+    owner's direct question): jump_crouch only anchors root HEIGHT (one
+    number), jump_crouch_feet_planted only anchors foot STILLNESS -- crouch
+    SHAPE (level vs sitting) was a free variable, and sitting back onto the
+    strong rear legs while the front stays half-extended is the mechanically
+    cheap way to reach a height target. Moderate starting weight (-2.0): a
+    real crouch is physiologically allowed some tilt (a dog's pre-jump fold
+    isn't perfectly rigid), a full ban would fight the fold itself.
+
+    phase="flight_landing" -- vendor phases 3-5 (apex/descent/touchdown
+    "корпус почти горизонтально"): the ORIGINAL 2026-08-12 term (bench
+    verdict on 34999: backward jump lifts the rear high, "попу поднимает
+    сильно"). 2026-08-23 night dive-fix history: gate narrowed to
+    airborne-or-landing only (excludes the launch push transient -- a real
+    jump physically passes through some momentary tilt during push-off);
+    weight raised -2.0 -> -6.0 after model_75996's dive postmortem (4
+    independent discriminators agreed the policy was diving nose-down to
+    farm rear-clearance/max-height credit cheaply -- TRAINING_STATE.md
+    2026-08-23 ~10:50). BUG-2 fix preserved: `(window_active & all_airborne)
+    | landing_active`, NOT `window_active & (all_airborne | landing_active)`
+    -- landing_active is BY DEFINITION past window_end, so the naive
+    parenthesization made the landing half always False."""
     term = env.command_manager.get_term(command_name)
     asset = env.scene["robot"]
     # projected_gravity_b xy components are 0 when the body is level.
     g_xy = asset.data.projected_gravity_b[:, 0:2]
     tilt = torch.sum(torch.square(g_xy), dim=1)
-    all_airborne = ~term.contacts.any(dim=1)
-    # 2026-08-23 night, base's review (BUG-2): `landing_active` is BY
-    # DEFINITION `elapsed >= window_end & had_flight` while `window_active`
-    # requires `elapsed < window_end` -- the two are mutually exclusive, so
-    # the ORIGINAL `window_active & (all_airborne | landing_active)` made
-    # `window_active & landing_active` always False, silently killing the
-    # landing half of this term entirely (attitude was NEVER actually priced
-    # on landing, despite the docstring's own claim). Parenthesization fixed:
-    # window_active gates ONLY the airborne branch (a real flight moment is
-    # always inside the window by construction); landing_active already
-    # carries its own sufficient gating (implies past window_end AND a real
-    # flight happened), doesn't need window_active additionally.
-    in_free = (term.window_active & all_airborne) | term.landing_active
-    return tilt * in_free.float()
+    if phase == "crouch":
+        gate = term.window_active & (term.phase < CROUCH_PHASE_END)
+    elif phase == "flight_landing":
+        all_airborne = ~term.contacts.any(dim=1)
+        gate = (term.window_active & all_airborne) | term.landing_active
+    else:
+        raise ValueError(f"jump_body_level: unknown phase {phase!r}")
+    return tilt * gate.float()
 
 
 def jump_motor_speed_violation(env, asset_cfg=None) -> torch.Tensor:
@@ -1001,27 +1035,6 @@ def jump_idle_still(env, command_name: str) -> torch.Tensor:
     return (v_xy + w_z) * (~in_free).float()
 
 
-def jump_idle_height(env, command_name: str, target_height: float) -> torch.Tensor:
-    """L2 height anchor active everywhere EXCEPT inside the jump window: idle and
-    landing must be a TALL stand. Exists because nothing else anchors height here --
-    base_height_l2 is deliberately zeroed (a jump's own height must swing freely
-    inside the window), and without any anchor the first from-scratch run idled in a
-    ~0.2m squat (the same free-variable-slides-away failure the vision variant hit,
-    see TRAIN_RESEARCH.md 2026-08-04: unanchored behavior drifts wherever the other
-    rewards push it). Flat terrain -> plain world-Z target, no scan needed."""
-    term = env.command_manager.get_term(command_name)
-    asset = env.scene["robot"]
-    err = torch.square(asset.data.root_pos_w[:, 2] - target_height)
-    # The landing slice is deliberately EXCLUDED too (2026-08-05, user question
-    # caught this): absorbing a landing means deep leg flexion -- the base dips to
-    # ~0.3-0.4m -- and anchoring height there directly fights jump_landing_impact's
-    # softness incentive; the cheap way to satisfy the anchor would be a stiff-legged
-    # slam. Idle proper is the only phase that must be a tall stand; the anchor
-    # takes over pulling the robot back up when the NEXT idle begins.
-    idle = ~term.window_active & ~term.landing_active
-    return err * idle.float()
-
-
 # Left-right joint pairs shared by the symmetry terms below.
 _LR_JOINT_PAIRS = [
     ("FL_hip_joint", "FR_hip_joint"),
@@ -1062,6 +1075,53 @@ def jump_idle_symmetry(env, command_name: str) -> torch.Tensor:
     asset = env.scene["robot"]
     idle = ~term.window_active & ~term.landing_active
     return _lr_asymmetry(asset) * idle.float()
+
+
+# Front/rear joint groups for the balance term below (hip excluded --
+# default hip=0 both front and rear, not diagnostic of sitting; thigh+calf
+# are where the "sit" shape lives).
+_FRONT_THIGH_CALF = ("FL_thigh_joint", "FR_thigh_joint", "FL_calf_joint", "FR_calf_joint")
+_REAR_THIGH_CALF = ("RL_thigh_joint", "RR_thigh_joint", "RL_calf_joint", "RR_calf_joint")
+
+
+def _front_rear_asymmetry(asset) -> torch.Tensor:
+    """|front deviation-from-default| - |rear deviation-from-default|, summed
+    thigh+calf. Front and rear share the EXACT SAME default_joint_pos (thigh=0.8,
+    calf=-1.5 for both -- confirmed directly in unitree.py's UNITREE_B2_CFG, not
+    assumed), so this direct comparison is valid without any per-leg offset
+    correction, unlike a left-right pairing that has to match named joints."""
+    joint_names = asset.joint_names
+    front_ids = [joint_names.index(n) for n in _FRONT_THIGH_CALF]
+    rear_ids = [joint_names.index(n) for n in _REAR_THIGH_CALF]
+    dev = torch.abs(asset.data.joint_pos - asset.data.default_joint_pos)
+    front_dev = dev[:, front_ids].sum(dim=1)
+    rear_dev = dev[:, rear_ids].sum(dim=1)
+    return torch.abs(front_dev - rear_dev)
+
+
+def jump_idle_front_rear_balance(env, command_name: str) -> torch.Tensor:
+    """Phase 0 (vendor: "StandFix, просто стоит на ногах") -- direct owner
+    diagnosis, 2026-08-23 morning: JUMP's idle pose measured as "sitting on
+    hind legs", confirmed numerically (check_idle_pose.py on model_75996):
+    idle base_z=0.4538m (vs 0.53m standing target), front thigh/calf
+    +48deg/-83deg vs rear +31deg/-106deg -- rear legs folded far more than
+    front, a real front-rear asymmetry, not a subjective impression.
+
+    Root cause: this file already prices left-right joint asymmetry
+    (jump_idle_symmetry, added 2026-08-09) but never front-vs-rear -- an
+    unpriced degree of freedom of the exact same class every other
+    free-variable lesson in this file's history already covers. The
+    now-removed jump_idle_height only anchored a SCALAR root height, which a
+    front-rear-asymmetric pose can satisfy just as cheaply as a level stand
+    (arguably cheaper: folding the strong rear legs while the front stays
+    extended is the mechanically easy way down). This prices the SHAPE
+    directly instead, mirroring jump_idle_symmetry's own idiom exactly (same
+    gate, same L1-of-deviation structure, front-vs-rear instead of
+    left-vs-right)."""
+    term = env.command_manager.get_term(command_name)
+    asset = env.scene["robot"]
+    idle = ~term.window_active & ~term.landing_active
+    return _front_rear_asymmetry(asset) * idle.float()
 
 
 def jump_flight_symmetry(env, command_name: str, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
@@ -1229,8 +1289,10 @@ def jump_landing_pose(env, command_name: str, asset_cfg=None) -> torch.Tensor:
 def jump_landing_height_stance(env, command_name: str, target_height: float) -> torch.Tensor:
     """Positive: exp-tracking of base height back to the standing target
     during the landing slice -- Atanassov's own `base_height_stance`.
-    Complements jump_idle_height (which deliberately EXCLUDES landing_active,
-    see its own docstring) by covering exactly the window that term skips."""
+    Covers landing height specifically (idle height itself is now covered
+    indirectly by the shape anchors -- see jump_idle_height's own removal
+    comment, 2026-08-23 morning, for why a scalar height anchor was dropped
+    in favor of pose-shape terms)."""
     term = env.command_manager.get_term(command_name)
     asset = env.scene["robot"]
     err = torch.square(asset.data.root_pos_w[:, 2] - target_height)
@@ -1524,24 +1586,22 @@ class UnitreeB2JumpRoughEnvCfg(UnitreeB2RoughEnvCfg):
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_calf"),
             },
         )
-        # New 2026-08-12 (bench on 34999: backward jump lifts the rear high,
-        # lands barely on balance -- see jump_launch_attitude's own docstring).
-        # Moderate weight: a jump needs SOME pitch freedom, this prices only
-        # the gross tilt that made landings marginal.
-        # -2.0 -> -6.0 (2026-08-23 night, base's postmortem on model_75996's
-        # dive): at -2.0 this term was outbid by jump_task_max_height, which
-        # pays near-max for a dive's OWN genuine (not faked) peak clearance --
-        # closing only the jump_rear_feet_liftoff income source (see that
-        # term's "DIVE-PROOFED" comment) left this second one open. Physics
-        # argument for the size of the jump, not just its direction: angular
-        # momentum is conserved in flight, so avoiding a pitched touchdown
-        # means not banking the rotation into the push in the first place --
-        # the penalty gradient during flight/landing has to be big enough to
-        # flow back into launch-phase symmetry, not just get paid past.
-        self.rewards.jump_launch_attitude = RewTerm(
-            func=jump_launch_attitude,
+        # jump_body_level, registered TWICE (2026-08-23 morning, JUMP v9
+        # restart -- see the function's own docstring for the full history
+        # of both windows). phase="crouch" is NEW this restart (vendor
+        # phase 1, "присела полностью" -- crouch shape was a free variable
+        # before, root cause traced one level deeper than the idle-sitting
+        # fix). phase="flight_landing" is the dive-fix weight (-6.0) kept
+        # unchanged from the previous run's postmortem.
+        self.rewards.jump_body_level_crouch = RewTerm(
+            func=jump_body_level,
+            weight=-2.0,
+            params={"command_name": "base_velocity", "phase": "crouch"},
+        )
+        self.rewards.jump_body_level_flight = RewTerm(
+            func=jump_body_level,
             weight=-6.0,
-            params={"command_name": "base_velocity"},
+            params={"command_name": "base_velocity", "phase": "flight_landing"},
         )
         self.rewards.jump_landing_impact = RewTerm(
             func=jump_landing_impact,
@@ -1563,17 +1623,40 @@ class UnitreeB2JumpRoughEnvCfg(UnitreeB2RoughEnvCfg):
             weight=-3.0,
             params={"command_name": "base_velocity"},
         )
-        self.rewards.jump_idle_height = RewTerm(
-            func=jump_idle_height,
-            weight=-8.0,
-            params={"command_name": "base_velocity", "target_height": 0.53},
-        )
+        # jump_idle_height REMOVED (2026-08-23 morning, JUMP v9 restart --
+        # base's review, decided from code not habit): it only anchored a
+        # SCALAR root height, which a front-rear-asymmetric "sitting" pose
+        # satisfies just as cheaply as a level stand -- the manipulable-
+        # anchor pattern this whole file's redesign history keeps finding,
+        # just discovered in idle instead of flight. Height is now covered
+        # INDIRECTLY but more robustly by shape anchors: stock
+        # stand_still_without_cmd (-2.0)/joint_pos_penalty (-1.0, both
+        # inherited from rough_env_cfg.py, price ALL-joint deviation from
+        # default_joint_pos, which IS the tall-standing pose) plus the two
+        # NEW/existing per-shape terms below (jump_idle_symmetry L-R,
+        # jump_idle_front_rear_balance F-R) -- together these constrain the
+        # POSE directly, which was the actual broken thing, not just its
+        # height projection. If idle height itself regresses under this
+        # combination, that is exactly what the phase-0 gate (external
+        # check against the stage_a_standing reference, base's design) is
+        # for -- catch it at the ~it2000 consolidation checkpoint, not
+        # after the whole budget.
         # New 2026-08-09 (bench: right leg tucked under body in idle -- see
         # jump_idle_symmetry's own docstring for the empirical diagnosis chain).
         # Weight matched to jump_idle_still (-3.0, same idle-only gate) -- assertive
         # since it never competes with the jump-phase economics (zero outside idle).
         self.rewards.jump_idle_symmetry = RewTerm(
             func=jump_idle_symmetry,
+            weight=-3.0,
+            params={"command_name": "base_velocity"},
+        )
+        # New 2026-08-23 morning (JUMP v9 restart, owner's direct diagnosis --
+        # see jump_idle_front_rear_balance's own docstring for the full
+        # numeric evidence chain). Weight matched to jump_idle_symmetry
+        # (-3.0, same idle-only gate, same L1-of-deviation structure) --
+        # this is the front-rear mirror of that exact term.
+        self.rewards.jump_idle_front_rear_balance = RewTerm(
+            func=jump_idle_front_rear_balance,
             weight=-3.0,
             params={"command_name": "base_velocity"},
         )
