@@ -1368,6 +1368,47 @@ def jump_flight_symmetry(env, command_name: str, sensor_cfg: SceneEntityCfg) -> 
     return _lr_asymmetry(asset) * active.float()
 
 
+_HIP_JOINT_NAMES = ("FL_hip_joint", "FR_hip_joint", "RL_hip_joint", "RR_hip_joint")
+
+
+def jump_hip_neutral(env, command_name: str) -> torch.Tensor:
+    """L2 penalty on hip-joint deviation from DEFAULT (0.0) -- an ABSOLUTE
+    anchor, unlike jump_flight_symmetry's _lr_asymmetry which only prices how
+    much the L-R PAIR differs from each other.
+
+    2026-08-24 night (owner's principle + base's diagnosis): after
+    jump_flight_symmetry's weight went -1.5->-6.0, 3 of 4 hips improved a lot
+    but RR got WORSE (touchdown delta vs idle -31.6deg -> -44.5deg) while the
+    RAW |RL-RR| pair gap actually shrank (55.0deg -> 49.7deg) -- confirmed
+    numerically, not guessed: the L-R term technically "worked" (the pair
+    converged), it just converged toward each other at a compromise point
+    instead of toward default, and RL (which started closer to default)
+    dragged RR further AWAY from ITS OWN default to meet it there. Symmetry
+    is necessary but not sufficient for what the owner asked for ("нога ровно
+    у default" -- an absolute target, not "matches its pair") -- both hips
+    could in principle drift together and _lr_asymmetry would never see it.
+
+    Same two-mechanism idiom idle already uses and that fixed this morning's
+    "sitting" bug: stand_still_without_cmd/joint_pos_penalty (absolute anchor,
+    all 12 DOF) alongside jump_idle_symmetry (L-R relative) -- crouch/flight
+    had ONLY the relative half after the ballistic-reach redesign removed the
+    old whole-pose anchor (deliberately, to let thigh/calf extend freely for
+    the push/reach -- see jump_landing_pose's own docstring) but never added
+    an absolute anchor scoped to JUST the hip axis, which should stay near
+    default throughout a straight (non-sideways) jump regardless of phase.
+    Hip only -- thigh/calf are explicitly NOT anchored here, they're supposed
+    to move, that's the jump itself."""
+    term = env.command_manager.get_term(command_name)
+    asset = env.scene["robot"]
+    joint_names = asset.joint_names
+    hip_ids = [joint_names.index(n) for n in _HIP_JOINT_NAMES]
+    err = torch.linalg.norm(
+        asset.data.joint_pos[:, hip_ids] - asset.data.default_joint_pos[:, hip_ids], dim=1
+    )
+    active = term.window_active | term.landing_active
+    return err * active.float()
+
+
 def jump_direction_velocity(env, command_name: str, max_vel: float) -> torch.Tensor:
     """Dense DIRECTIONAL bootstrap (2026-08-05, after run 14-38-22 converged to a
     vertical jump-in-place): velocity along the commanded direction during the
@@ -1913,13 +1954,62 @@ class UnitreeB2JumpRoughEnvCfg(UnitreeB2RoughEnvCfg):
         # weight: a symmetric tuck costs zero, so this only bites lopsidedness;
         # kept below idle_symmetry's -3.0 because flight competes with the live
         # jump economics (direction/precision) in a way idle never does.
+        # -1.5 -> -6.0 (2026-08-24, owner caught live: forward jump lands with all
+        # 4 legs splayed sideways, "shpagat" -- check_landing_splay.py (new
+        # permanent diagnostic) quantified the regression: hip L-R delta at
+        # touchdown grew 21deg (model_19099, fully-gated) -> 25deg (sparse-only
+        # crouch fix) -> 42deg (today's depth-conditional crouch fix), monotonic
+        # with how deep/aggressive the crouch got. base's two cheap traces (both
+        # confirmed numerically before this change): (1) full-cycle hip-diff
+        # timeline shows the asymmetry EXPLODES specifically during ballistic
+        # flight (nfeet=0, no ground contact -- policy-driven joint commands, not
+        # body-rotation carryover), from ~-15deg right after liftoff up to +95deg
+        # at its peak, already inside THIS term's own airborne gate; (2) jump_
+        # landing_pose's own squared-error at touchdown is 72.9% hip -- hip does
+        # NOT get diluted in that sum, it dominates, so the failure isn't a
+        # dilution bug, it's that -1.5 was never strong enough to matter. Ceiling
+        # comparison at the peak observed error (143.6deg total _lr_asymmetry sum
+        # = 2.506rad): old -1.5*2.506=-3.76/step, an order of magnitude below the
+        # competing dense terms' ceilings in the same window (jump_vertical_
+        # launch=14.0, jump_flight=8.0, jump_direction_velocity=4.0). New -6.0 at
+        # that same peak = -15.0 (comparable to, not exceeding, vertical_launch's
+        # own ceiling -- a deliberate, sizeable step, not a moderate nudge, since
+        # base's read was the gap itself is an order of magnitude, not a percent).
+        # Joint-set/window were ALREADY correct (same _lr_asymmetry helper as
+        # jump_idle_symmetry, already gated on the exact window the explosion
+        # happens in) -- this is a pure re-weighting, not a new term.
         self.rewards.jump_flight_symmetry = RewTerm(
             func=jump_flight_symmetry,
-            weight=-1.5,
+            weight=-6.0,
             params={
                 "command_name": "base_velocity",
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_calf"),
             },
+        )
+        # 2026-08-24 night (base's design): absolute hip-to-default anchor,
+        # alongside (not replacing) jump_flight_symmetry -- see jump_hip_
+        # neutral's own docstring for the diagnosis (RR got WORSE while the
+        # raw L-R pair gap shrank, confirming the relative-only term can
+        # converge to a shared wrong compromise instead of true default).
+        # Weight -8.0, computed numerically (not guessed) from this
+        # checkpoint's OWN touchdown data (model_33595, L2 norm of the 4 hip
+        # errors from default, radians):
+        #   worst observed (this touchdown, FL/FR/RL/RR=+16.4/-21.6/+22.2/
+        #   -27.5deg): L2=0.7776rad -> -8.0*0.7776 = -6.22/step
+        #   idle baseline (FL/FR/RL/RR=-6.4/-3.2/+5.5/+17.0deg, itself not
+        #   perfectly zeroed): L2=0.3360rad -> -8.0*0.3360 = -2.69/step
+        #   near-ideal (~5deg each hip): L2=0.1745rad -> -8.0*0.1745 = -1.40/step
+        # -8.0 matches jump_crouch's own ceiling (-8.0) -- this term is now
+        # active during crouch too (window_active from phase=0, not gated to
+        # post-CROUCH_PHASE_END like flight_symmetry), so it directly
+        # competes against jump_crouch/jump_body_level_crouch there, and
+        # against vertical_launch/flight/flight_symmetry during the airborne
+        # slice. At the worst observed error it's comparable to jump_crouch's
+        # own pull, not dwarfed by it.
+        self.rewards.jump_hip_neutral = RewTerm(
+            func=jump_hip_neutral,
+            weight=-8.0,
+            params={"command_name": "base_velocity"},
         )
         # Weight history (the jump-vs-direction economics took three passes):
         # v1: vertical 8, direction absent -> perfect vertical jump IN PLACE.
