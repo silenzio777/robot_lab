@@ -36,6 +36,8 @@ Jump distance target: ~0.5m to start (real B2 manages ~1m; scale up later, e.g. 
 raising the airborne-velocity clip / window length, once 0.5m lands reliably).
 """
 
+import os
+
 import torch
 
 import isaaclab.utils.math as math_utils
@@ -126,6 +128,27 @@ class JumpPulseCommand(CommandTerm):
         # can't.
         self._prev_in_crouch = torch.zeros(n, dtype=torch.bool, device=self.device)
         self.crouch_transition_edge = torch.zeros(n, dtype=torch.bool, device=self.device)
+        # 2026-08-24 night (owner's order + base's design): the edge fix above
+        # concentrated PRESSURE at the crouch->launch boundary but didn't touch
+        # WHEN that boundary happens -- three clean weight-18.0 probes (short,
+        # then a full ~3000-real-iteration budget via JUMP_SKIP_CONSOLIDATION)
+        # showed the crouch getting SHALLOWER and the reversal point EARLIER as
+        # training progressed (0.4411m/73% -> 0.4794m/62.3% -> 0.4847m/57.1%),
+        # not better -- base's diagnosis: `phase` is pure elapsed-time, so
+        # leaving the fold early structurally BUYS more real time inside the
+        # launch/flight reward budget (terms worth 14+25+6) within the same
+        # fixed window_duration. No sparse-term weight can outbid a genuine
+        # extra-time structural advantage. Fix has to be architectural: hold
+        # the crouch->launch boundary open past CROUCH_PHASE_END until real
+        # depth is achieved (or a generous hard cap expires), by freezing the
+        # command term's OWN resampling clock (`self.time_left`) for held envs
+        # -- see _update_command's own comment block for why this (not
+        # rewriting in_crouch/the other 10 raw `phase >= /< CROUCH_PHASE_END`
+        # gates elsewhere in this file) is the minimal correct fix.
+        # `crouch_hold_time` is real elapsed SECONDS spent holding this cycle
+        # (compared against CROUCH_HOLD_HARD_CAP), separate from `phase` itself
+        # (which the hold keeps just under CROUCH_PHASE_END throughout).
+        self.crouch_hold_time = torch.zeros(n, device=self.device)
         # Peak world-Z reached so far THIS CYCLE -- the episodic max_height
         # analog. Reset to the current (near-standing, since a fresh cycle always
         # starts in idle) height at each resample, same "reset to standing
@@ -250,6 +273,7 @@ class JumpPulseCommand(CommandTerm):
         self.landing_edge[env_ids] = False
         self._prev_in_crouch[env_ids] = False
         self.crouch_transition_edge[env_ids] = False
+        self.crouch_hold_time[env_ids] = 0.0
         # v7 fix (2026-08-19, claude-tg-base's review, caught before launch):
         # clamped to STANDING_TARGET_HEIGHT, not the raw live root z. This
         # _resample_command call also fires on a fresh EPISODE reset (see
@@ -281,6 +305,44 @@ class JumpPulseCommand(CommandTerm):
         elapsed = self.cycle_duration - self.time_left
         window_start = self.idle_duration
         window_end = self.idle_duration + self.cfg.window_duration
+
+        # 2026-08-24 night, depth-conditional crouch->launch boundary (owner's
+        # order, base's design -- see crouch_hold_time's own __init__ comment
+        # for the full diagnosis this addresses). Single source of truth: this
+        # is the ONLY place that touches `elapsed`/`self.time_left` for the
+        # hold. window_active below, landing_timer, and IsaacLab's own
+        # CommandTerm.compute() auto-resample (`time_left <= 0`,
+        # command_manager.py:160-166 -- confirmed by reading the source, that
+        # decrement happens THIS SAME compute() call, right before
+        # _update_command() runs, using the identical dt as self._env.step_dt)
+        # all derive from this same elapsed/time_left, so freezing it here is
+        # enough to correctly stall ALL of them together -- no separate edits
+        # needed to window_end, cycle_duration, or the other 10 raw
+        # `phase >= /< CROUCH_PHASE_END` gates elsewhere in this file (list
+        # verified 2026-08-24: lines ~437,804,834,867,960,977,1045,1085,1168,
+        # 1278,1306,1340) -- they keep working unmodified because `phase`
+        # itself provably never reaches CROUCH_PHASE_END while held, same as
+        # a normal (non-extended) crouch.
+        tentative_window_active = (elapsed >= window_start) & (elapsed < window_end)
+        tentative_phase = torch.where(
+            tentative_window_active,
+            ((elapsed - window_start) / self.cfg.window_duration).clamp(0.0, 1.0),
+            torch.zeros_like(elapsed),
+        )
+        depth_ok = self.robot.data.root_pos_w[:, 2] <= (CROUCH_TARGET_HEIGHT + CROUCH_DEPTH_TOLERANCE)
+        cap_hit = self.crouch_hold_time >= CROUCH_HOLD_HARD_CAP
+        need_hold = tentative_window_active & (tentative_phase >= CROUCH_PHASE_END) & ~depth_ok & ~cap_hit
+        if torch.any(need_hold):
+            step_dt = self._env.step_dt
+            # Cancel THIS step's time_left decrement for held envs only -- the
+            # base class already subtracted step_dt before calling us, so
+            # adding it back leaves elapsed (and everything derived from it)
+            # exactly where it was last step, i.e. still just under
+            # CROUCH_PHASE_END.
+            self.time_left[need_hold] += step_dt
+            self.crouch_hold_time[need_hold] += step_dt
+            elapsed = self.cycle_duration - self.time_left
+
         self.window_active = (elapsed >= window_start) & (elapsed < window_end)
 
         # v7 gate-fix: arm had_flight the first time all four feet are genuinely
@@ -482,7 +544,20 @@ class JumpPulseCommandCfg(CommandTermCfg):
 # (this task's agents/rsl_rl_ppo_cfg.py, unchanged) -> 2000*24=48000.
 # env.common_step_counter units, same formula leg_lift_env_cfg.py's own
 # STANDING_CONSOLIDATION_STEPS comment derives its 50400 from.
-JUMP_STANDING_CONSOLIDATION_STEPS = 48000
+#
+# 2026-08-23 night (base's design, crouch-fix probe extension): this gate is
+# keyed on env.common_step_counter, an attribute of the ENVIRONMENT OBJECT --
+# it is NOT persisted in the checkpoint and always starts at 0 for a fresh
+# process, regardless of which donor checkpoint's WEIGHTS got loaded. That's
+# correct for a genuine cold start (donor never learned to stand), but wastes
+# ~2000 iterations re-consolidating a donor that already passed the full
+# jump gate (its weights already carry the learned crouch/stand shape -- the
+# code-level gate was protection against not-yet-knowing the shape, not a
+# standing requirement). Opt-in escape hatch, off by default -- does NOT
+# change behavior for real cold starts (stage_a_standing donors etc), only
+# for a resume the operator explicitly marks as already-proven via this env
+# var (set right before launching train.py, not a permanent config change).
+JUMP_STANDING_CONSOLIDATION_STEPS = 0 if os.environ.get("JUMP_SKIP_CONSOLIDATION") else 48000
 
 # 4-phase jump structure inside the 1.1s window (2026-08-05, modeled on how a real
 # Go2/B2 actually executes a jump, per the user's own frame-by-frame observation):
@@ -548,6 +623,34 @@ CROUCH_TARGET_HEIGHT_SIGMA = 0.02  # verified numerically before launch, see
 # this trial, redo the FK check as a genuine 2D (thigh, calf) optimization
 # over a physically-sensible joint-angle region instead of the 1D
 # calf-only sweep this pass used.
+#
+# 2026-08-24 night (owner's order + base's design/approval): the edge-
+# triggered jump_crouch_depth_at_transition term above priced depth AT the
+# crouch->launch boundary but the boundary itself stayed a pure timer
+# (phase >= CROUCH_PHASE_END) -- three clean weight-18.0 probes (short, then
+# a full ~3000-real-iteration budget via JUMP_SKIP_CONSOLIDATION) showed the
+# crouch getting SHALLOWER and the reversal EARLIER as training progressed
+# (0.4411m/73% -> 0.4794m/62.3% -> 0.4847m/57.1%), the opposite of what a
+# working fix should do. Diagnosis: leaving the fold early structurally BUYS
+# more real time inside the launch/flight reward budget within the same
+# fixed window_duration -- no sparse-term weight can outbid a genuine extra-
+# time structural advantage. See crouch_hold_time's own __init__ comment and
+# _update_command's own comment block for the architectural fix (hold the
+# boundary open past CROUCH_PHASE_END until real depth is achieved or a
+# generous hard cap expires, by freezing the command term's own resampling
+# clock for held envs).
+# Cap derivation: normal crouch phase = CROUCH_PHASE_END * window_duration =
+# 0.35*1.1 = 0.385s. Base approved doubling -- this grants the SAME amount
+# again on top, worst case 0.77s total crouch. launch(0.275s)+flight(0.44s)+
+# landing(0.5s) all keep their exact original durations regardless of hold
+# length -- the hold delays their start, it does not compress them (verified
+# arithmetically with base before implementing, not assumed).
+CROUCH_HOLD_HARD_CAP = 0.385  # seconds, additional to the normal 0.385s crouch
+# Depth-satisfied threshold for releasing an env from an extended hold --
+# same 0.05m tolerance as base's own gate criterion (min root_z <=0.35m),
+# self-consistent: an env only exits an extended hold once it has genuinely
+# met the same bar this whole fix is measured against.
+CROUCH_DEPTH_TOLERANCE = 0.05  # meters, added to CROUCH_TARGET_HEIGHT
 # v3->v4 (2026-08-16, owner bench verdict on 24999: "еле-еле прыгает", flight_distance
 # down ~30% vs the prior checkpoint 33399, 0.22->0.16, despite vertical_launch and
 # direction_velocity holding steady). Root cause traced to jump_airborne_front_leg_pose
