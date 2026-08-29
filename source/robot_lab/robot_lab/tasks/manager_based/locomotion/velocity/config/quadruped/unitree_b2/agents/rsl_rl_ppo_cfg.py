@@ -136,6 +136,51 @@ class UnitreeB2JumpPPORunnerCfg(UnitreeB2RoughPPORunnerCfg):
 
 
 @configclass
+class UnitreeB2JumpV10PPORunnerCfg(UnitreeB2JumpPPORunnerCfg):
+    def __post_init__(self):
+        super().__post_init__()
+
+        # Separate logs/rsl_rl/unitree_b2_jump_v10/ directory -- the v10 line
+        # (2026-08-26, owner's from-scratch minimal redesign) is a genuinely
+        # different gym task (jump_v10_env_cfg.py, not jump_env_cfg.py) and
+        # warm-starts from stage_a_standing, not any prior jump-line
+        # checkpoint -- keeping it in the OLD unitree_b2_jump directory would
+        # mix incompatible checkpoint histories (different reward economy,
+        # different command semantics) under one experiment name.
+        self.experiment_name = "unitree_b2_jump_v10"
+
+        # 0.01 -> 0.005, REVERTED back (2026-08-27 evening, base's diagnosis,
+        # empirically confirmed): the 0.01 restoration below (same day,
+        # earlier) was meant to help ignition exploration, but it did the
+        # opposite -- noise_std climbed to a ~1.7 plateau, and a direct
+        # stochastic-noise probe (jump_v10_stochastic_idle_probe.py) proved
+        # this reliably trips illegal_contact-magnitude forces (1000s of N)
+        # on base_link/hip/thigh during idle/crouch, across every tested
+        # seed. Since launch_active_ratio measured EXACTLY 0.0000 across the
+        # ENTIRE run's log (6440/6440 samples) -- launch was never once
+        # reached in a training rollout -- the raised entropy never even got
+        # to explore the launch phase it was raised for; it only spent its
+        # extra noise budget killing episodes in idle/crouch, the one phase
+        # already warm-started and not in need of exploration. Reverting to
+        # the same 0.005 already proven correct for jump-v3/rear_stand/
+        # leg_lift's own version of this exact instability signature. Paired
+        # with idle_time_range (2,4)->(0.75,1.5) in jump_v10_env_cfg.py (same
+        # diagnosis, complementary fix -- see that file's own comment).
+        #
+        # ORIGINAL comment (2026-08-27 morning, now superseded, kept for
+        # history): this class inherits from UnitreeB2JumpPPORunnerCfg,
+        # which halves entropy_coef 0.01->0.005 for a completely different
+        # reason (2026-08-08 overnight action_rate_l2 instability on the OLD
+        # jump-v3 economy) -- jump_v10 silently carried that halved value
+        # despite never having that instability, and despite the ignition
+        # problem (see jump_v10_launch_calf_extend's own docstring) needing
+        # MORE exploration, not less, right when it matters. Restored to
+        # rough's own stock 0.01 -- jump_v10-specific override, doesn't
+        # touch the old jump line's own tuned 0.005.
+        self.algorithm.entropy_coef = 0.005
+
+
+@configclass
 class UnitreeB2LegLiftPPORunnerCfg(UnitreeB2RoughPPORunnerCfg):
     def __post_init__(self):
         super().__post_init__()
