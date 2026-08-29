@@ -90,6 +90,23 @@ class UnitreeB2CrawlPPORunnerCfg(UnitreeB2RoughPPORunnerCfg):
 
 
 @configclass
+class UnitreeB2HandstandPPORunnerCfg(UnitreeB2RoughPPORunnerCfg):
+    def __post_init__(self):
+        super().__post_init__()
+
+        # Own logs/rsl_rl/unitree_b2_handstand/ directory. Default entropy_coef
+        # (0.01, inherited) kept as-is for this first pass -- NOT copying rear_
+        # stand's own 0.005 override, since that fix was diagnosed against a
+        # SPECIFIC observed action_rate_l2 instability on rear_stand's own
+        # training run, not a general rule for "any 2-leg-support skill". If
+        # the same instability signature (sustained value_function loss blowup,
+        # 1000+ iterations, not self-resolving) shows up here too, this is the
+        # first thing to check -- see UnitreeB2RearStandPPORunnerCfg's own
+        # comment for the exact diagnostic signature to compare against.
+        self.experiment_name = "unitree_b2_handstand"
+
+
+@configclass
 class UnitreeB2RearStandPPORunnerCfg(UnitreeB2RoughPPORunnerCfg):
     def __post_init__(self):
         super().__post_init__()

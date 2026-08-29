@@ -128,6 +128,31 @@ gym.register(
 )
 
 gym.register(
+    # Stage A: static handstand balance, no walk/turn command -- see
+    # handstand_env_cfg.py's own module docstring for the full staging
+    # rationale (mirrors RearStandStageA's own precedent).
+    id="RobotLab-Isaac-Velocity-Rough-Unitree-B2-Handstand-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.handstand_env_cfg:UnitreeB2HandstandEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeB2HandstandPPORunnerCfg",
+        "cusrl_cfg_entry_point": f"{agents.__name__}.cusrl_ppo_cfg:UnitreeB2RoughTrainerCfg",
+    },
+)
+
+gym.register(
+    id="RobotLab-Isaac-Velocity-Rough-Unitree-B2-RampWalk-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ramp_walk_env_cfg:UnitreeB2RampWalkEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeB2WalkPPORunnerCfg",
+        "cusrl_cfg_entry_point": f"{agents.__name__}.cusrl_ppo_cfg:UnitreeB2RoughTrainerCfg",
+    },
+)
+
+gym.register(
     id="RobotLab-Isaac-Velocity-Rough-Unitree-B2-Vision-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
