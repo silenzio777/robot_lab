@@ -1359,9 +1359,33 @@ class UnitreeB2JumpV10RoughEnvCfg(UnitreeB2RoughEnvCfg):
         # underlying complaint (both joints moving) was real and confirmed
         # numerically at -6.0, so going below it isn't warranted, but -12.0
         # overshot into full paralysis.
+        #
+        # -8.0 -> -10.0 (2026-08-30, train+base autonomous diagnosis,
+        # owner explicitly authorized acting without waiting for his sign-off
+        # on this kind of routine mid-training tune -- see TRAINING_STATE.md
+        # ~00:00-00:15): two successive, EACH-LARGER thigh_vel/v_z spikes on
+        # the live bench (it116700: thigh_vel 4.13-4.69, v_z 0.62-0.68;
+        # it119600: thigh_vel 4.97-5.03 [new max], v_z 0.70-0.73 [new max]),
+        # each followed by a lagged Episode_Termination/bad_orientation rise
+        # in the training log aggregate -- and critically, the trough BETWEEN
+        # cycles is also rising (cycle 1 receded to thigh_vel 2.67-2.86,
+        # cycle 2 only receded to 3.31-3.84), i.e. growing exploit, not a
+        # damped oscillation around equilibrium. Root cause: v_z (~0.6-0.7
+        # m/s) is still far from JUMP_V10_LAUNCH_VZ_CLAMP=3.5, so marginal
+        # utility of more v_z hasn't saturated -- nothing structurally caps
+        # the pull toward "more thigh" except a soft -8.0 against a combined
+        # 20.0 outcome weight. Moderate step, NOT back to -12.0 (that value's
+        # own documented history above is total launch paralysis) -- new
+        # ratio outcome:thigh_hold = 20:10 = 2:1, still decisively favors
+        # attempting a real push (vs the paralysis case's ~14:12 ~= 1.17:1),
+        # while roughly doubling the cost of the thigh-driven strategy
+        # relative to its current payoff. Re-verify thigh_vel/v_z/
+        # bad_orientation trend over the next several checkpoints; if this
+        # also proves insufficient, escalate toward -12.0 in smaller steps
+        # (e.g. -11.0) rather than repeating the same overshoot.
         self.rewards.jump_v10_launch_thigh_hold = RewTerm(
             func=jump_v10_launch_thigh_hold,
-            weight=-8.0,
+            weight=-10.0,
             params={"command_name": "base_velocity"},
         )
 
