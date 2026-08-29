@@ -45,6 +45,24 @@ class UnitreeB2WalkPPORunnerCfg(UnitreeB2RoughPPORunnerCfg):
         # run (same recipe as crawl/rear_stand's own note above).
         self.experiment_name = "unitree_b2_walk"
 
+        # entropy_coef 0.01 -> 0.005 (2026-08-26, base's diagnosis): the
+        # base_height_l2=-16.0 jitter-free control hit a sustained Loss/
+        # learning_rate floor-pin (200+ iterations, no recovery) with
+        # PROGRESSIVELY worsening Train/mean_reward (not a single-step spike
+        # with immediate recovery -- the two earlier benign floor-touches in
+        # this same run recovered within ~90 iterations with reward staying
+        # healthy throughout) at it29280+, ~2100 iterations into the run --
+        # base recognized this as the SAME signature already diagnosed and
+        # fixed three times elsewhere in this project: jump (2026-08-08,
+        # noise_std climbed and never reconverged), rear_stand (2026-08-10,
+        # sustained action_rate_l2 instability 1200+ iterations), leg_lift
+        # (2026-08-13, worst single-iteration reward growing in severity
+        # across consecutive checks) -- see each cfg's own comment below.
+        # WALK was the one B2 skill in this family that never got this fix.
+        # Walk-only override -- doesn't touch rough/crawl/rear_stand/jump/
+        # leg_lift/vision's own entropy_coef.
+        self.algorithm.entropy_coef = 0.005
+
 
 @configclass
 class UnitreeB2FlatPPORunnerCfg(UnitreeB2RoughPPORunnerCfg):
