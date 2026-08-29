@@ -90,6 +90,19 @@ class UnitreeB2RampWalkEnvCfg(UnitreeB2WalkRoughEnvCfg):
         super().__post_init__()
         self.scene.terrain.terrain_generator = B2_RAMP_TERRAINS_CFG
 
+        # FIX (train, 2026-08-30, found at launch): UnitreeB2WalkRoughEnvCfg's own
+        # disable_zero_weight_rewards() call is gated on
+        # self.__class__.__name__ == "UnitreeB2WalkRoughEnvCfg" (walk_env_cfg.py),
+        # so it does NOT fire for this subclass -- every zero-weight scaffolding
+        # term (e.g. wheel_vel_penalty, dormant for non-wheeled robots,
+        # joint_names="") stays a real RewTerm instead of being turned into None,
+        # and the reward manager crashes trying to resolve its empty joint_names
+        # against B2's actual joints ("Not all regular expressions are matched").
+        # Same class of bug already documented+fixed in vision_env_cfg.py and
+        # jump_v10_env_cfg.py's own subclasses -- missing here, not a new mechanism.
+        if self.__class__.__name__ == "UnitreeB2RampWalkEnvCfg":
+            self.disable_zero_weight_rewards()
+
         # Warm-start note (matches every sibling terrain-only fork's own
         # comment, e.g. crawl/rear_stand): WALK's own obs/action shapes are
         # untouched by this file (no height_scan added, unlike vision_env_cfg's
