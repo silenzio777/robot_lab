@@ -156,6 +156,7 @@ class JumpCrouchLaunchCommand(CommandTerm):
         )
         self._foot_local_offset = torch.tensor(FOOT_GEOM_LOCAL_OFFSET, device=self.device)
         self.min_foot_clearance = torch.zeros(n, device=self.device)
+        self.all_airborne = torch.zeros(n, dtype=torch.bool, device=self.device)
 
     @property
     def command(self) -> torch.Tensor:
@@ -193,6 +194,17 @@ class JumpCrouchLaunchCommand(CommandTerm):
         contact_sensor = self._env.scene.sensors[self._feet_sensor_cfg.name]
         in_contact = contact_sensor.data.current_contact_time[:, self._feet_sensor_order] > 0.0
         all_airborne = ~in_contact.any(dim=1)
+        # Stored persistently (2026-08-29, base's design, step (а) of the
+        # somersault fix -- see jump_v10_level/jump_v10_yaw_rate's own updated
+        # gate below): this was a local var before, recomputed but discarded
+        # every step. bad_orientation (step (б), same day) already stops a
+        # tumble from completing, but level/yaw_rate's own gate still only
+        # covers crouch_active|launch_active -- exposing this as ground truth
+        # for "still physically airborne right now" (not just "launch's own
+        # timer hasn't expired yet") lets those two terms cover the real
+        # post-launch inertial-flight window too, closing the gap at its
+        # source instead of only backstopping the consequence.
+        self.all_airborne = all_airborne
         calf_pos_w = self.robot.data.body_pos_w[:, self._calf_body_ids, :]
         calf_quat_w = self.robot.data.body_quat_w[:, self._calf_body_ids, :]
         n_envs = calf_pos_w.shape[0]
@@ -502,22 +514,40 @@ def jump_v10_level(env, command_name: str, phase: str) -> torch.Tensor:
     """Owner's core constraint, both phases: 'корпус ровно, без тангажа/крена'.
     projected_gravity_b xy is exactly zero when the body is level, regardless
     of yaw -- gravity-projected tilt, not a chosen orientation anchor, same
-    non-gameable quantity the old file's jump_body_level already used."""
+    non-gameable quantity the old file's jump_body_level already used.
+
+    launch-phase gate EXTENDED 2026-08-29 (base's design, step (а) of the
+    somersault fix -- see step (б), jump_v10_illegal_contact's landing-grace
+    sibling in terminations, and self.all_airborne's own new docstring in
+    JumpCrouchLaunchCommand): the old `launch_active` gate turned off the
+    instant LAUNCH_DURATION's own timer expired (0.8s), while the body was
+    still airborne on the kick's own momentum for a second+ longer -- exactly
+    the window the 2026-08-29 live-bench somersault happened in, with ZERO
+    orientation pressure the whole time. `term.all_airborne` is ground-truth
+    "not touching the ground right now" (contact-sensor derived, updated every
+    step), so `launch_active | all_airborne` covers the real inertial-flight
+    tail regardless of which phase-timer label the state machine happens to
+    be in at that instant -- this closes the gap at its source; mdp.
+    bad_orientation (step б, same day) remains the hard safety backstop
+    underneath it, not replaced by this."""
     term = env.command_manager.get_term(command_name)
     asset = env.scene["robot"]
     g_xy = asset.data.projected_gravity_b[:, 0:2]
     tilt = torch.sum(torch.square(g_xy), dim=1)
-    gate = term.crouch_active if phase == "crouch" else term.launch_active
+    gate = term.crouch_active if phase == "crouch" else (term.launch_active | term.all_airborne)
     return tilt * gate.float()
 
 
 def jump_v10_yaw_rate(env, command_name: str) -> torch.Tensor:
     """Owner's core constraint: 'без YAW-верчения' -- priced directly as yaw
     angular velocity squared (not a heading-drift anchor), active through
-    BOTH crouch and launch (the whole active cycle, not just the push)."""
+    BOTH crouch and launch (the whole active cycle, not just the push).
+
+    Gate EXTENDED 2026-08-29 alongside jump_v10_level -- same reasoning, same
+    all_airborne addition, same somersault-window gap this closes."""
     term = env.command_manager.get_term(command_name)
     asset = env.scene["robot"]
-    active = (term.crouch_active | term.launch_active).float()
+    active = (term.crouch_active | term.launch_active | term.all_airborne).float()
     return torch.square(asset.data.root_ang_vel_w[:, 2]) * active
 
 
