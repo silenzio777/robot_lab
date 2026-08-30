@@ -35,6 +35,22 @@ class UnitreeB2RoughPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
 
 @configclass
+class UnitreeB2WalkResetPPORunnerCfg(UnitreeB2RoughPPORunnerCfg):
+    def __post_init__(self):
+        super().__post_init__()
+
+        # Own logs/rsl_rl/unitree_b2_walk_reset/ directory -- deliberately
+        # separate from unitree_b2_walk/ (walk_env_cfg.py's own accumulated
+        # line) so this reset attempt doesn't get confused with or warm-start
+        # from a checkpoint trained under the phase-clock economy this file
+        # intentionally omits. entropy_coef stays at the base 0.01 default --
+        # matches Rudin et al.'s own Table 3 (entropy_coef=0.01) exactly, and
+        # the 0.005 override elsewhere in this file was diagnosed against a
+        # SPECIFIC instability (base_height_l2=-16.0 jitter) not present here.
+        self.experiment_name = "unitree_b2_walk_reset"
+
+
+@configclass
 class UnitreeB2WalkPPORunnerCfg(UnitreeB2RoughPPORunnerCfg):
     def __post_init__(self):
         super().__post_init__()
@@ -244,6 +260,34 @@ class UnitreeB2LegLiftPPORunnerCfg(UnitreeB2RoughPPORunnerCfg):
         # re-triggering these spikes. Leg-lift-only override -- doesn't touch rough/
         # crawl/vision's own entropy_coef.
         self.algorithm.entropy_coef = 0.005
+
+
+@configclass
+class UnitreeB2ImitationPPORunnerCfg(UnitreeB2RoughPPORunnerCfg):
+    def __post_init__(self):
+        super().__post_init__()
+
+        # Own logs/rsl_rl/unitree_b2_imitation/ directory -- отдельная задача
+        # (imitation_env_cfg.py), не warm-start ни от одного из существующих
+        # чекпоинтов (наблюдение отличается -- фаза вместо velocity_commands).
+        self.experiment_name = "unitree_b2_imitation"
+
+        # Первый sanity-check прогон одного короткого клипа (12.86с эпизод,
+        # ~643 шага на 50Гц) -- 5000 итераций как стартовая точка (тот же
+        # порядок, что UnitreeB2FlatPPORunnerCfg's собственный первый заход),
+        # не откалибровано под imitation специфично -- если reward сойдётся
+        # заметно раньше/позже, скорректировать по факту первого прогона, не
+        # гадать заранее (тот же принцип, что весь остальной этот файл).
+        self.max_iterations = 5000
+
+        # entropy_coef оставлен на дефолте (0.01, унаследован) -- НЕ
+        # копирую chi-л/jump/rear_stand's 0.005 override, та диагностировалась
+        # против КОНКРЕТНОЙ нестабильности (action_rate_l2/vloss blow-up) на
+        # ИХ рид-экономике, не общее правило "imitation-задачи нужен меньший
+        # энтропийный бонус". Если та же сигнатура (устойчивый vloss>1000,
+        # сотни итераций, не разрешается само) появится и здесь -- см.
+        # UnitreeB2RearStandPPORunnerCfg's собственный комментарий за точной
+        # диагностической сигнатурой для сравнения, тогда и решать.
 
 
 @configclass

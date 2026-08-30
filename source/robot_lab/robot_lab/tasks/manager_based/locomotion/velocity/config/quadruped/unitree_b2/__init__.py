@@ -32,6 +32,21 @@ gym.register(
 )
 
 gym.register(
+    # Систематический возврат к минимальному проверенному рецепту (Rudin
+    # et al. CoRL2021) поверх стоковой rough-экономики -- не расширение
+    # walk_env_cfg.py, отдельная, дисциплинированная линия. См.
+    # walk_reset_env_cfg.py's own module docstring для полного обоснования.
+    id="RobotLab-Isaac-Velocity-Rough-Unitree-B2-WalkReset-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.walk_reset_env_cfg:UnitreeB2WalkResetEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeB2WalkResetPPORunnerCfg",
+        "cusrl_cfg_entry_point": f"{agents.__name__}.cusrl_ppo_cfg:UnitreeB2RoughTrainerCfg",
+    },
+)
+
+gym.register(
     id="RobotLab-Isaac-Velocity-Rough-Unitree-B2-Walk-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
@@ -148,6 +163,20 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.ramp_walk_env_cfg:UnitreeB2RampWalkEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeB2WalkPPORunnerCfg",
+        "cusrl_cfg_entry_point": f"{agents.__name__}.cusrl_ppo_cfg:UnitreeB2RoughTrainerCfg",
+    },
+)
+
+gym.register(
+    # Путь 1: DeepMimic-style PMC-imitation на ретаргетнутом mocap
+    # (dog_idle_003, Tencent lifelike-agility-and-play) -- см.
+    # imitation_env_cfg.py's own module docstring для полного дизайна.
+    id="RobotLab-Isaac-Velocity-Flat-Unitree-B2-Imitation-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.imitation_env_cfg:UnitreeB2ImitationEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeB2ImitationPPORunnerCfg",
         "cusrl_cfg_entry_point": f"{agents.__name__}.cusrl_ppo_cfg:UnitreeB2RoughTrainerCfg",
     },
 )
