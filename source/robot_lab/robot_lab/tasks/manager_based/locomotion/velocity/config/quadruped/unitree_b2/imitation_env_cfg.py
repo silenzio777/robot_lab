@@ -135,10 +135,19 @@ PMC_SCALE_ROOT_ANGLE = 10.0
 PMC_SCALE_ROOT_LIN_VEL = 2.0
 PMC_SCALE_ROOT_ANG_VEL = 0.2
 
-# Early-termination -- ЧИСЛА TENCENT, непроверенные под B2 (см. модульный
-# докстринг) -- первая точка, требует перекалибровки по факту.
-DIVERGE_POS_ERR_SQ_THRESHOLD = 1.0  # m^2, суммарно по root+joints (см. termination-функцию)
-DIVERGE_ANGLE_ERR_THRESHOLD = 1.0  # rad
+# Early-termination -- Tencent-числа (1.0/1.0) были непроверенными под B2 --
+# перекалиброваны 2026-08-31 по факту (train: RSI-error-distribution замер
+# на b2_imitation_4999_final, 30 стартов, тот же метод, что termination
+# использует): p99 ошибки ВНУТРИ здорового (до-расхождения) участка уже
+# 0.93-0.96 у обеих величин -- 1.0 был впритык к естественному потолку
+# здорового трекинга, слишком туго. Умеренное расширение (base: "~1.0->1.3",
+# дёшево, применяем в любом случае) -- даёт немного пространства
+# recoverable-заминкам (было 18% случаев restore within window), не
+# открывая шлюз для катастрофических срывов (те растут в разы за порог
+# 10-35x, никакой разумный подъём порога их не поймает). См.
+# train_research/TRAINING_STATE.md записи ~08:4x/~12:2x для полных цифр.
+DIVERGE_POS_ERR_SQ_THRESHOLD = 1.3  # m^2, суммарно по root+joints (см. termination-функцию)
+DIVERGE_ANGLE_ERR_THRESHOLD = 1.3  # rad
 
 # base's находка 2026-08-31 (проверено b2 на JSON напрямую): foot_targets --
 # ЦЕНТРЫ СФЕР стопы (радиус 0.032м), не точки контакта с полом. Merge_fixed_
