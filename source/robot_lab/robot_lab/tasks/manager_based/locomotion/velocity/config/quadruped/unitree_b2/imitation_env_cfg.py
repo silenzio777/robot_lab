@@ -149,6 +149,34 @@ PMC_SCALE_ROOT_ANG_VEL = 0.2
 DIVERGE_POS_ERR_SQ_THRESHOLD = 1.3  # m^2, суммарно по root+joints (см. termination-функцию)
 DIVERGE_ANGLE_ERR_THRESHOLD = 1.3  # rad
 
+# Prioritized RSI по бинам фазы (2026-09-01, train+base) -- найдено:
+# честный per-phase sweep на реальном чекпоинте (it3100 первого from-scratch
+# на патченном референсе) с ЧЕСТНЫМ RSI-телепортом показал провал (>90°
+# наклон) на 17/20 точек РАВНОМЕРНО ПО ВСЕМУ КЛИПУ, не только у self-collision
+# сегмента -- обычный uniform-RSI тратит одинаковый бюджет семплов на уже
+# решённые и на упорно нерешаемые участки. Идея Tencent (per-clip
+# P(clip)~(1-avg_reward)^3, применяем ту же логику на уровне бинов ВНУТРИ
+# одного клипа, т.к. у нас всего 1 клип, а не пачка): трекаем EMA "какую долю
+# ОСТАВШЕГОСЯ клипа обычно проходят, стартуя из этого бина" -- сигнал уже
+# бесплатно доступен в _resample_command (self.ref_time в момент вызова, ДО
+# перезаписи, = докуда доехал эпизод, стартовавший в предыдущем бине), не
+# нужен отдельный reward-хук. Сэмплируем следующий старт с весом
+# (1-прогресс)^PHASE_PRIORITY_POWER, тяжёлые бины оверсэмплятся автоматически
+# и динамически (не статичный снимок с одного чекпоинта -- веса живут и
+# двигаются вместе с тем, что политика реально освоила).
+#
+# PHASE_PRIORITY_FLOOR (base's находка, PER-ловушка): чистая (1-progress)^p
+# без пола может выжать вероятность у УЖЕ решённых бинов почти до нуля -- то
+# самое "чиним одно, роняем другое" prioritized-replay забывание. floor=0.15
+# гарантирует, что даже полностью решённый бин (progress=1) сохраняет 15%
+# от максимального веса -- достаточно, чтобы политика продолжала изредка
+# видеть эти состояния и не забывала их, но всё ещё сильно смещает бюджет
+# семплов к трудным местам (0.15 vs 1.0 -- почти 7-кратный перекос).
+N_PHASE_BINS = 16
+PHASE_PRIORITY_POWER = 2.0
+PHASE_PRIORITY_FLOOR = 0.15
+PHASE_PRIORITY_EMA_ALPHA = 0.02  # медленная EMA -- 4096 envs/итерация, апдейтов много
+
 # base's находка 2026-08-31 (проверено b2 на JSON напрямую): foot_targets --
 # ЦЕНТРЫ СФЕР стопы (радиус 0.032м), не точки контакта с полом. Merge_fixed_
 # joints=True при импорте URDF схлопывает "*_foot" (сфера) в "*_calf" (нет
@@ -258,6 +286,18 @@ class MotionRefCommand(CommandTerm):
 
         self.ref_time = torch.zeros(self.num_envs, device=self.device)
 
+        # Prioritized RSI по бинам фазы -- см. константы N_PHASE_BINS и
+        # соседей выше за полным обоснованием. bin_difficulty стартует
+        # РОВНО в 1.0 (максимальный вес = чистый uniform на первом же
+        # ресете, пока EMA ещё не накопила ни одного реального замера) --
+        # веса расходятся от uniform ТОЛЬКО по мере поступления данных.
+        self.bin_width = self.duration_s / N_PHASE_BINS
+        self.bin_difficulty = torch.ones(N_PHASE_BINS, device=self.device)
+        # -1 = "эпизода ещё не было, нечего засчитывать в EMA" (первый вызов
+        # _resample_command на каждый env, до перезаписи -- отличаем от
+        # реального бина 0 явным сентинелом, не нулём).
+        self.start_bin = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
+
     @staticmethod
     def _finite_diff(x: torch.Tensor, dt: float) -> torch.Tensor:
         v = torch.zeros_like(x)
@@ -315,16 +355,59 @@ class MotionRefCommand(CommandTerm):
         self.metrics["phase_mean"] = self.ref_time / self.duration_s
 
     def _resample_command(self, env_ids):
-        """RSI: случайный старт-момент клипа + телепорт робота на этот
-        референс-кадр. Вызывается CommandManager.reset() на КАЖДОМ
-        env-reset безусловно (проверено напрямую, см. модульный докстринг) --
-        resampling_time_range держим огромным, чтобы это НЕ срабатывало
-        дополнительно посреди эпизода (см. Cfg ниже)."""
+        """RSI: старт-момент клипа + телепорт робота на этот референс-кадр.
+        Вызывается CommandManager.reset() на КАЖДОМ env-reset безусловно
+        (проверено напрямую, см. модульный докстринг) -- resampling_time_range
+        держим огромным, чтобы это НЕ срабатывало дополнительно посреди
+        эпизода (см. Cfg ниже).
+
+        2026-09-01: старт-момент теперь НЕ чистый uniform -- prioritized
+        по бинам фазы, см. константы N_PHASE_BINS/PHASE_PRIORITY_* выше за
+        полным обоснованием (честный per-phase sweep нашёл провал почти
+        по всему клипу, не только в одном месте -- обычный uniform-RSI
+        тратит одинаковый бюджет на решённое и на нерешаемое)."""
         n = len(env_ids)
         if n == 0:
             return
         env_ids_t = torch.as_tensor(env_ids, device=self.device)
-        start_times = torch.rand(n, device=self.device) * self.duration_s
+
+        # --- EMA-апдейт по СТАРОМУ бину (докуда доехал эпизод, который сейчас
+        # завершается) -- self.ref_time тут ЕЩЁ старое значение (перезапишем
+        # ниже), это и есть "докуда дошли до срабатывания termination/timeout".
+        had_prior_episode = self.start_bin[env_ids_t] >= 0
+        if had_prior_episode.any():
+            done_idx = env_ids_t[had_prior_episode]
+            prior_bin = self.start_bin[done_idx]
+            prior_start_time = prior_bin.to(self.ref_time.dtype) * self.bin_width
+            achieved = self.ref_time[done_idx]
+            remaining = (self.duration_s - prior_start_time).clamp(min=1e-6)
+            progress = ((achieved - prior_start_time) / remaining).clamp(0.0, 1.0)
+            # index_add_ + отдельный счётчик вместо scatter-mean -- несколько
+            # envs МОГУТ завершиться в один и тот же бин на одном ресете
+            # (4096 параллельных сред), обычное присваивание потеряло бы все,
+            # кроме последнего; так усредняем честно по факту, затем EMA.
+            bin_sum = torch.zeros(N_PHASE_BINS, device=self.device)
+            bin_count = torch.zeros(N_PHASE_BINS, device=self.device)
+            bin_sum.index_add_(0, prior_bin, progress)
+            bin_count.index_add_(0, prior_bin, torch.ones_like(progress))
+            touched = bin_count > 0
+            batch_mean_progress = torch.zeros(N_PHASE_BINS, device=self.device)
+            batch_mean_progress[touched] = bin_sum[touched] / bin_count[touched]
+            batch_difficulty = 1.0 - batch_mean_progress
+            self.bin_difficulty[touched] = (
+                (1.0 - PHASE_PRIORITY_EMA_ALPHA) * self.bin_difficulty[touched]
+                + PHASE_PRIORITY_EMA_ALPHA * batch_difficulty[touched]
+            )
+
+        # --- Новый старт: сэмплируем бин пропорционально приоритету, джиттер
+        # внутри бина непрерывный (не залипаем на границах бинов).
+        weight = PHASE_PRIORITY_FLOOR + (1.0 - PHASE_PRIORITY_FLOOR) * self.bin_difficulty.clamp(
+            0.0, 1.0
+        ) ** PHASE_PRIORITY_POWER
+        new_bin = torch.multinomial(weight, n, replacement=True)
+        jitter = torch.rand(n, device=self.device)
+        start_times = (new_bin.to(self.ref_time.dtype) + jitter) * self.bin_width
+        self.start_bin[env_ids_t] = new_bin
         self.ref_time[env_ids_t] = start_times
 
         ref = self.query(start_times)
