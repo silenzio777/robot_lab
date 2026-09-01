@@ -111,7 +111,14 @@ from .flat_env_cfg import UnitreeB2FlatEnvCfg
 # хотя НЕ идеально ноль на всех трёх, вопреки первому отчёту (см.
 # train_research/TRAINING_STATE.md за точными цифрами). Пробуем все три,
 # сравниваем, продолжаем на лучшем -- см. TRAINING_STATE.md.
-MOTION_JSON_PATH = Path("/home/silenzio/lib/urdf_stand/retargeted_csv/training/dog_idle_003_prepatch_wide15cm.json")
+# 2026-09-01: победитель сравнения 5/10/15см (train, честный per-phase sweep):
+# 10см -- 14/20 FAIL (лучший результат дня, достигнут за 3000 итераций
+# против 8800 у узкой колеи). 5см=17/20 (self-collision почти не ушла),
+# 15см=15/20 (self-collision ушла полностью, но растущая IK-ошибка на
+# ноге RL начинает перевешивать выгоду -- ровно тот компромисс, о котором
+# предупреждал b2). См. train_research/TRAINING_STATE.md за полными
+# цифрами и продолжением обучения на этом варианте.
+MOTION_JSON_PATH = Path("/home/silenzio/lib/urdf_stand/retargeted_csv/training/dog_idle_003_prepatch_wide10cm.json")
 
 
 def _read_motion_meta(path: Path) -> tuple[float, int]:
