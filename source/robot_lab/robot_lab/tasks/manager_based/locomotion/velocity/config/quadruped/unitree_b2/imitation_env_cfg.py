@@ -111,7 +111,7 @@ from .flat_env_cfg import UnitreeB2FlatEnvCfg
 # хотя НЕ идеально ноль на всех трёх, вопреки первому отчёту (см.
 # train_research/TRAINING_STATE.md за точными цифрами). Пробуем все три,
 # сравниваем, продолжаем на лучшем -- см. TRAINING_STATE.md.
-MOTION_JSON_PATH = Path("/home/silenzio/lib/urdf_stand/retargeted_csv/training/dog_idle_003_prepatch_wide5cm.json")
+MOTION_JSON_PATH = Path("/home/silenzio/lib/urdf_stand/retargeted_csv/training/dog_idle_003_prepatch_wide10cm.json")
 
 
 def _read_motion_meta(path: Path) -> tuple[float, int]:
