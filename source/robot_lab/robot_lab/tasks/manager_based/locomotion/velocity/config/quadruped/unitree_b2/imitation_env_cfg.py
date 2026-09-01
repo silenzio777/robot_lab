@@ -297,6 +297,16 @@ class MotionRefCommand(CommandTerm):
         # _resample_command на каждый env, до перезаписи -- отличаем от
         # реального бина 0 явным сентинелом, не нулём).
         self.start_bin = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
+        # ТОЧНОЕ время старта (не bin_idx*bin_width -- та аппроксимация
+        # игнорирует джиттер внутри бина, до +-bin_width систематическая
+        # ошибка в progress, нашли живьём 2026-09-01: 2800 итераций
+        # приоритизированного сэмплинга с этим багом дали РЕГРЕССИЮ
+        # 14/20->18-19/20 FAIL на честном phase-sweep -- завышенный
+        # progress занижал difficulty именно средне-трудных бинов,
+        # сэмплинг съезжал не туда. self.start_bin остаётся (нужен для
+        # индекса EMA-бина), start_time хранится отдельно для точной
+        # арифметики progress.
+        self.start_time = torch.zeros(self.num_envs, device=self.device)
 
     @staticmethod
     def _finite_diff(x: torch.Tensor, dt: float) -> torch.Tensor:
@@ -378,7 +388,7 @@ class MotionRefCommand(CommandTerm):
         if had_prior_episode.any():
             done_idx = env_ids_t[had_prior_episode]
             prior_bin = self.start_bin[done_idx]
-            prior_start_time = prior_bin.to(self.ref_time.dtype) * self.bin_width
+            prior_start_time = self.start_time[done_idx]  # ТОЧНОЕ время (с джиттером), не bin_idx*bin_width
             achieved = self.ref_time[done_idx]
             remaining = (self.duration_s - prior_start_time).clamp(min=1e-6)
             progress = ((achieved - prior_start_time) / remaining).clamp(0.0, 1.0)
@@ -408,6 +418,7 @@ class MotionRefCommand(CommandTerm):
         jitter = torch.rand(n, device=self.device)
         start_times = (new_bin.to(self.ref_time.dtype) + jitter) * self.bin_width
         self.start_bin[env_ids_t] = new_bin
+        self.start_time[env_ids_t] = start_times
         self.ref_time[env_ids_t] = start_times
 
         ref = self.query(start_times)
