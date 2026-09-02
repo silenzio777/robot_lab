@@ -128,7 +128,18 @@ from .flat_env_cfg import UnitreeB2FlatEnvCfg
 # 17:20: b2 перерезал тот же кусок из wide10cm (лучший трек imitation-эры);
 # проверено мной: те же 189/1.566с/2.6 м/с, стык 0.169 rad. wide5cm-вариант
 # (dog_idle_003_walk_clip.json) остаётся запасным.
-MOTION_JSON_PATH = Path("/home/silenzio/lib/urdf_stand/retargeted_csv/training/dog_idle_003_walk_clip_wide10cm.json")
+# 2026-09-03 ~00:40: переключение пайплайн-теста на МЕДЛЕННЫЙ ШАГ b2
+# (дизайн train+base, критерий сработал: рысь it2400 kernel 0.142 < 0.3 и
+# ПАДАЕТ vs 0.209@1000 -- три конфига рыси сошлись к плато, связывающее =
+# падения на динамике 2.6 м/с, GAE не из чего учиться). Клип проверен:
+# 120 кадров / 0.991с, 1.01 м/с (0.86-1.22), стык 0.082 rad (лучший),
+# z 0.533-0.548, root перецентрован к нулю b2-ом (861eb3d -- КРИТИЧНО:
+# старая версия со смещением 12.75м спавнила бы все среды за краем клеток).
+# Пороги (base, калибровка по старой эре): it1000 kernel>=0.35 И растёт;
+# it2000 >=0.55; тревога -- плоско <=0.25. Рысь вернётся поверх доказанного
+# пайплайна (каррикулум: старт с медленного чекпоинта / time-rescale).
+# Прежний клип: dog_idle_003_walk_clip_wide10cm.json (рысь 2.6).
+MOTION_JSON_PATH = Path("/home/silenzio/lib/urdf_stand/retargeted_csv/training/dog_quad_walk_001_slowloop_wide10cm.json")
 
 
 def _read_motion_meta(path: Path) -> tuple[float, int]:
