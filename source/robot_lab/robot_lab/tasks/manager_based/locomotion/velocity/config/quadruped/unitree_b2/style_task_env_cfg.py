@@ -249,3 +249,12 @@ class UnitreeB2StyleTaskEnvCfg(UnitreeB2WalkResetEnvCfg):
             func=style_root_rp, weight=STYLE_WEIGHT_ROOT_RP,
             params={"command_name": "style_phase", "asset_cfg": SceneEntityCfg("robot")},
         )
+
+        # Зачистка нулевых термов ОБЯЗАТЕЛЬНА и именно здесь: в родителях
+        # она под гвардом `__class__.__name__ == "...WalkResetEnvCfg"` --
+        # для сабкласса не срабатывает, и wheel_vel_penalty (weight=0,
+        # joint_names="" -- колёсные роботы) доживает до резолва и роняет
+        # старт («Not all regular expressions are matched», первый запуск
+        # гибрида 2026-09-03). Style-веса ненулевые -- зачистка их не
+        # трогает.
+        self.disable_zero_weight_rewards()
