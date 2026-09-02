@@ -118,7 +118,14 @@ from .flat_env_cfg import UnitreeB2FlatEnvCfg
 # ноге RL начинает перевешивать выгоду -- ровно тот компромисс, о котором
 # предупреждал b2). См. train_research/TRAINING_STATE.md за полными
 # цифрами и продолжением обучения на этом варианте.
-MOTION_JSON_PATH = Path("/home/silenzio/lib/urdf_stand/retargeted_csv/training/dog_idle_003_prepatch_wide10cm.json")
+# 2026-09-02: короткий walk-клип от b2 для сквозной проверки IL-пайплайна
+# (189 кадров / 1.566 с, почти зациклен -- стык суставов max 0.164 rad).
+# ПРОВЕРЕНО по данным перед подстановкой: движение непрерывное (без
+# телепортов), но скорость 2.6 м/с (рысь, НЕ медленная ходьба -- хозяину
+# сообщено); курс вдоль +Y, yaw~102deg -- RSI-телепорт берёт root из
+# кадра, для тренировки ориентация не помеха. Прежний клип:
+# dog_idle_003_prepatch_wide10cm.json (лучший результат эры -- it2999).
+MOTION_JSON_PATH = Path("/home/silenzio/lib/urdf_stand/retargeted_csv/training/dog_idle_003_walk_clip.json")
 
 
 def _read_motion_meta(path: Path) -> tuple[float, int]:
