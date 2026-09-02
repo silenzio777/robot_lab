@@ -125,7 +125,10 @@ from .flat_env_cfg import UnitreeB2FlatEnvCfg
 # сообщено); курс вдоль +Y, yaw~102deg -- RSI-телепорт берёт root из
 # кадра, для тренировки ориентация не помеха. Прежний клип:
 # dog_idle_003_prepatch_wide10cm.json (лучший результат эры -- it2999).
-MOTION_JSON_PATH = Path("/home/silenzio/lib/urdf_stand/retargeted_csv/training/dog_idle_003_walk_clip.json")
+# 17:20: b2 перерезал тот же кусок из wide10cm (лучший трек imitation-эры);
+# проверено мной: те же 189/1.566с/2.6 м/с, стык 0.169 rad. wide5cm-вариант
+# (dog_idle_003_walk_clip.json) остаётся запасным.
+MOTION_JSON_PATH = Path("/home/silenzio/lib/urdf_stand/retargeted_csv/training/dog_idle_003_walk_clip_wide10cm.json")
 
 
 def _read_motion_meta(path: Path) -> tuple[float, int]:
