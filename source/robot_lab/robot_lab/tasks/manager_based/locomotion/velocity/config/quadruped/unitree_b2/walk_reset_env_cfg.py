@@ -70,7 +70,17 @@ from .rough_env_cfg import UnitreeB2RoughEnvCfg
 # feet_air_time : track_lin_vel = 2.0 : 1.0 у них -> при нашем 3.0 это 6.0.
 # Наше текущее (в walk_env_cfg.py) WALK-значение было 3.0 -- вдвое меньше
 # пропорции рецепта.
-WALK_RESET_FEET_AIR_TIME_WEIGHT = 6.0
+#
+# v3 (2026-09-02): 6.0 -> 3.0. Пропорция 2:1 была из ТАБЛИЦЫ статьи; сверка
+# ЖИВОГО кода legged_gym (base, master leggedrobotics) дала 1:1 к tracking
+# (1.0/1.0 при их весах), т.е. при нашем tracking=3.0 -- ровно 3.0, что
+# совпадает и со старым WALK-значением walk_env_cfg.py. Мотив: v2 к it10700
+# вышел на kernel tracking 61% и стоит с it6042 (curriculum законно заперт
+# на 0.5, порог 0.8), честный гейт: tracking 0.083 при команде 0.6, поза
+# "мордой вниз", sync упал -- air-time-доминантная экономика оплачивает
+# "шагание ради шагания" лучше разгона. ЕДИНСТВЕННОЕ изменение v3, resume
+# от model_10700 (навык хороший, меняется только экономика поверх).
+WALK_RESET_FEET_AIR_TIME_WEIGHT = 3.0
 
 # joint_motion (vel+acc вместе) : track_lin_vel = 0.001 : 1.0 у них -> при
 # нашем 3.0 это 0.003 суммарно. Делим пополам между vel/acc как первая
