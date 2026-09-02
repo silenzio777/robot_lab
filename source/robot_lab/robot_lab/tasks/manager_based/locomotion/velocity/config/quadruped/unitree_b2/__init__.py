@@ -191,3 +191,19 @@ gym.register(
         "cusrl_cfg_entry_point": f"{agents.__name__}.cusrl_ppo_cfg:UnitreeB2RoughTrainerCfg",
     },
 )
+
+
+gym.register(
+    # Style+Task гибрид (2026-09-03): velocity-tracking walk_reset (v4-пакет)
+    # + style-награды подтверждённого slowwalk-клипа (confirmed_skills/
+    # il_slow_walk) + круговые фазовые часы (obs 45+2). Управляемая
+    # джойстиком походка «как собака» -- см. style_task_env_cfg.py.
+    id="RobotLab-Isaac-Velocity-Rough-Unitree-B2-StyleTask-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.style_task_env_cfg:UnitreeB2StyleTaskEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeB2StyleTaskPPORunnerCfg",
+        "cusrl_cfg_entry_point": f"{agents.__name__}.cusrl_ppo_cfg:UnitreeB2RoughTrainerCfg",
+    },
+)

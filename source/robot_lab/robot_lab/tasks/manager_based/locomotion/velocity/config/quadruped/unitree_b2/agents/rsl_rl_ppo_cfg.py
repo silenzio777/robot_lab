@@ -302,3 +302,14 @@ class UnitreeB2VisionPPORunnerCfg(UnitreeB2RoughPPORunnerCfg):
         # docstring: the observation shape itself differs once height_scan is back on),
         # so there's no seed-checkpoint step for this one, just a from-scratch run.
         self.experiment_name = "unitree_b2_vision"
+
+
+@configclass
+class UnitreeB2StyleTaskPPORunnerCfg(UnitreeB2WalkResetPPORunnerCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        # Style+Task гибрид (style_task_env_cfg.py, 2026-09-03) -- своя
+        # папка логов, отдельная от walk_reset (другая экономика: + style-
+        # термы slowwalk-клипа, obs 47).
+        self.experiment_name = "unitree_b2_style_task"
+        self.max_iterations = 30000
