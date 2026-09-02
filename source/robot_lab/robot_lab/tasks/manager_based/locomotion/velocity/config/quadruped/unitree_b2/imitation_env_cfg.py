@@ -147,6 +147,29 @@ def _read_motion_meta(path: Path) -> tuple[float, int]:
 _MOTION_FRAME_DT, _MOTION_N_FRAMES = _read_motion_meta(MOTION_JSON_PATH)
 MOTION_DURATION_S = (_MOTION_N_FRAMES - 1) * _MOTION_FRAME_DT
 
+# ---------------------------------------------------------------------------
+# CLIP_LOOP (2026-09-02, «пайплайн-тест v2», дизайн train+base): зациклить
+# референс для ЦИКЛИЧНОГО клипа (рысь). Диагноз первого прогона рыси: при
+# episode_length_s=длина клипа и фазе-клампе КАЖДЫЙ эпизод заканчивается
+# сегментом «мгновенно замри с 2.6 м/с» (физически невозможная задача,
+# ~треть опыта), поздние RSI-старты почти невыигрышны -- kernel плоский
+# ~0.2 с it1000 по двум независимым чистым замерам (in-clip kernel стенда
+# и tensorboard per-lived-second). Одна концептуальная переменная «сделать
+# задачу честно цикличной»: (а) референс-lookup по t mod T; (б) мировой
+# root_pos + НАКОПЛЕННОЕ смещение k*Δцикла (Δ = чистый ход клипа за цикл,
+# z занулён) -- референс становится бесконечной прямой рысью без швов
+# (root_pose-терм PMC трекает мировую позицию, без накопления на каждом
+# стыке была бы мгновенная ошибка ~4.07 м >> порога 1.3 -- терминация на
+# каждом обороте, диагноз base); foot_targets мировые -- то же смещение;
+# (в) фаза в obs -> (cos, sin) 2π·(t mod T)/T, obs 43->44 (линейная фаза
+# с клампом теряет смысл на цикле; стендовый playback-драйвер должен
+# строить cos/sin из своего фазового счётчика); (г) эпизод 3 полных цикла.
+# Пороги/веса/RSI-uniform/всё остальное -- ЗАМОРОЖЕНО 1:1 с первым прогоном.
+# Швы: root_quat стык 0.169 rad терпим (проверено по данным клипа).
+CLIP_LOOP = True
+LOOP_N_CYCLES = 3
+LOOP_EPISODE_LENGTH_S = LOOP_N_CYCLES * MOTION_DURATION_S
+
 # PMC reward -- реальные веса из train_scripts статьи (Supplementary Tencent
 # lifelike-agility-and-play), не дефолт кода. Полное обоснование --
 # `~/base/DISTILLED/2026-08-31_imitation-path1-plan.md`.
@@ -327,6 +350,12 @@ class MotionRefCommand(CommandTerm):
 
         self.ref_time = torch.zeros(self.num_envs, device=self.device)
 
+        # CLIP_LOOP: чистое смещение клипа за цикл (мировой фрейм, z занулён
+        # -- вертикального хода у цикличной рыси нет, накапливать его дрейф
+        # незачем). Используется в query() как k*Δ поверх lookup по t mod T.
+        self.cycle_offset = (self.ref_root_pos[-1] - self.ref_root_pos[0]).clone()
+        self.cycle_offset[2] = 0.0
+
         # Prioritized RSI по бинам фазы -- см. константы N_PHASE_BINS и
         # соседей выше за полным обоснованием. bin_difficulty стартует
         # РОВНО в 1.0 (максимальный вес = чистый uniform на первом же
@@ -368,11 +397,15 @@ class MotionRefCommand(CommandTerm):
         return w
 
     def query(self, times: torch.Tensor) -> dict[str, torch.Tensor]:
-        """times: (N,) секунды, клампится в [0, duration_s] -- запрос ЗА
-        пределами клипа замораживается на последнем кадре (не оборачивается,
-        не экстраполируется -- см. модульный докстринг про "эпизод
-        заканчивается на конце клипа")."""
-        t = times.clamp(0.0, self.duration_s)
+        """times: (N,) секунды. CLIP_LOOP=False: клампится в [0, duration_s]
+        -- запрос ЗА пределами клипа замораживается на последнем кадре.
+        CLIP_LOOP=True: lookup по t mod T + накопленное смещение k*Δцикла к
+        мировым root_pos/foot_targets -- бесконечная прямая рысь без швов."""
+        if CLIP_LOOP:
+            k = (times / self.duration_s).floor().clamp(min=0.0)
+            t = (times - k * self.duration_s).clamp(0.0, self.duration_s)
+        else:
+            t = times.clamp(0.0, self.duration_s)
         frame_f = t / self.frame_dt
         idx0 = frame_f.long().clamp(0, self.n_frames - 2)
         idx1 = idx0 + 1
@@ -386,6 +419,10 @@ class MotionRefCommand(CommandTerm):
         root_lin_vel = torch.lerp(self.ref_root_lin_vel[idx0], self.ref_root_lin_vel[idx1], a1)
         root_ang_vel = torch.lerp(self.ref_root_ang_vel[idx0], self.ref_root_ang_vel[idx1], a1)
         foot_targets = torch.lerp(self.ref_foot_targets[idx0], self.ref_foot_targets[idx1], a1.unsqueeze(-1))
+        if CLIP_LOOP:
+            shift = k.unsqueeze(-1) * self.cycle_offset
+            root_pos = root_pos + shift
+            foot_targets = foot_targets + shift.unsqueeze(1)
         return {
             "root_pos": root_pos,
             "root_quat": root_quat,
@@ -398,12 +435,17 @@ class MotionRefCommand(CommandTerm):
 
     @property
     def command(self) -> torch.Tensor:
-        # Политика видит ТОЛЬКО фазу (0->1), не target-pose -- архитектурное
-        # решение, см. модульный докстринг. Не цикличен -> без sin/cos.
+        # Политика видит ТОЛЬКО фазу, не target-pose -- архитектурное
+        # решение, см. модульный докстринг. CLIP_LOOP=False: линейная фаза
+        # 0->1 с клампом (нецикличный клип). CLIP_LOOP=True: (cos, sin)
+        # 2π·(t mod T)/T -- непрерывна на стыке цикла, obs 43->44.
+        if CLIP_LOOP:
+            ang = 2.0 * torch.pi * (self.ref_time % self.duration_s) / self.duration_s
+            return torch.stack([torch.cos(ang), torch.sin(ang)], dim=-1)
         return (self.ref_time / self.duration_s).clamp(0.0, 1.0).unsqueeze(-1)
 
     def _update_metrics(self):
-        self.metrics["phase_mean"] = self.ref_time / self.duration_s
+        self.metrics["phase_mean"] = (self.ref_time % self.duration_s) / self.duration_s if CLIP_LOOP else self.ref_time / self.duration_s
 
     def _resample_command(self, env_ids):
         """RSI: старт-момент клипа + телепорт робота на этот референс-кадр.
@@ -431,7 +473,13 @@ class MotionRefCommand(CommandTerm):
             prior_bin = self.start_bin[done_idx]
             prior_start_time = self.start_time[done_idx]  # ТОЧНОЕ время (с джиттером), не bin_idx*bin_width
             achieved = self.ref_time[done_idx]
-            remaining = (self.duration_s - prior_start_time).clamp(min=1e-6)
+            if CLIP_LOOP:
+                # На цикле «остаток до конца клипа» не определён -- прогресс
+                # меряем к горизонту эпизода (3 цикла). При floor=1.0 бины
+                # всё равно uniform, это только диагностика EMA.
+                remaining = torch.full_like(prior_start_time, LOOP_EPISODE_LENGTH_S)
+            else:
+                remaining = (self.duration_s - prior_start_time).clamp(min=1e-6)
             progress = ((achieved - prior_start_time) / remaining).clamp(0.0, 1.0)
             # index_add_ + отдельный счётчик вместо scatter-mean -- несколько
             # envs МОГУТ завершиться в один и тот же бин на одном ресете
@@ -486,7 +534,11 @@ class MotionRefCommand(CommandTerm):
         # Монотонно продвигаем время для ВСЕХ сред каждый шаг (не гейтится
         # ни на что -- imitation всегда "играет", в отличие от
         # GaitPhaseCommand's should_move-заморозки, той семантики тут нет).
-        self.ref_time = (self.ref_time + self._env.step_dt).clamp(0.0, self.duration_s)
+        # CLIP_LOOP: без клампа -- query() сам оборачивает по t mod T.
+        if CLIP_LOOP:
+            self.ref_time = self.ref_time + self._env.step_dt
+        else:
+            self.ref_time = (self.ref_time + self._env.step_dt).clamp(0.0, self.duration_s)
 
 
 @configclass
@@ -625,8 +677,10 @@ class UnitreeB2ImitationEnvCfg(UnitreeB2FlatEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        # ------------------------------Episode length = длина клипа------------------------------
-        self.episode_length_s = MOTION_DURATION_S
+        # ------------------------------Episode length------------------------------
+        # CLIP_LOOP: 3 полных цикла (~4.7с) -- убирает «тормози и замри»
+        # хвост; без loop -- длина клипа как раньше.
+        self.episode_length_s = LOOP_EPISODE_LENGTH_S if CLIP_LOOP else MOTION_DURATION_S
 
         # ------------------------------Commands: motion_ref заменяет base_velocity------------------------------
         self.commands.base_velocity = None
@@ -637,16 +691,20 @@ class UnitreeB2ImitationEnvCfg(UnitreeB2FlatEnvCfg):
         # sim-to-real асимметрия actor/critic, не специфично для imitation.
         self.observations.policy.velocity_commands = None
         self.observations.critic.velocity_commands = None
+        # CLIP_LOOP: фаза = (cos, sin) в [-1, 1] -- clip (0,1) обрезал бы
+        # отрицательную полуволну (пойман при подготовке loop-варианта до
+        # запуска); для линейной фазы прежний clip сохранён 1:1.
+        _phase_clip = (-1.0, 1.0) if CLIP_LOOP else (0.0, 1.0)
         self.observations.policy.ref_phase = ObsTerm(
             func=mdp.generated_commands,
             params={"command_name": "motion_ref"},
-            clip=(0.0, 1.0),
+            clip=_phase_clip,
             scale=1.0,
         )
         self.observations.critic.ref_phase = ObsTerm(
             func=mdp.generated_commands,
             params={"command_name": "motion_ref"},
-            clip=(0.0, 1.0),
+            clip=_phase_clip,
             scale=1.0,
         )
 
