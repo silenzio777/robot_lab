@@ -113,6 +113,13 @@ class StylePhaseCommand(CommandTerm):
         assert found == data["joint_order"]
         self.joint_ids = joint_ids
 
+        # Стопы (calf-прокси, как во всём репо) -- для терраин-инвариантной
+        # высоты style_root_h (см. функцию: root_z − mean(feet_z)).
+        foot_names = ["FR_calf", "FL_calf", "RR_calf", "RL_calf"]
+        body_ids, found_b = self.asset.find_bodies(foot_names, preserve_order=True)
+        assert found_b == foot_names
+        self.foot_body_ids = body_ids
+
         self.phase_time = torch.zeros(self.num_envs, device=self.device)
 
     def _lookup(self, values: torch.Tensor) -> torch.Tensor:
@@ -186,9 +193,16 @@ def style_joint_vel(env, command_name: str, asset_cfg: SceneEntityCfg) -> torch.
 
 
 def style_root_h(env, command_name: str, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    # ТЕРРАИН-ИНВАРИАНТНО (фикс 2026-09-03, it272 первого рана): мировая
+    # высота на rough-рельефе читала бугры как ошибку -- kernel замерен
+    # 0.003, терм был мёртвым шумом (флаг №2 ревью base). Root-относительная
+    # форма: высота root над СРЕДНИМ уровнем стоп vs высота клипа над его
+    # землёй (клип ровный, стопы ~0).
     cmd: StylePhaseCommand = env.command_manager.get_term(command_name)
     asset: Articulation = env.scene[asset_cfg.name]
-    err = (asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2] - cmd.ref_h()).abs()
+    feet_z = asset.data.body_pos_w[:, cmd.foot_body_ids, 2].mean(dim=1)
+    height = asset.data.root_pos_w[:, 2] - feet_z
+    err = (height - cmd.ref_h()).abs()
     return torch.exp(-STYLE_SCALE_ROOT_H * err)
 
 
