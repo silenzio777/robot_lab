@@ -193,16 +193,17 @@ def style_joint_vel(env, command_name: str, asset_cfg: SceneEntityCfg) -> torch.
 
 
 def style_root_h(env, command_name: str, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-    # ТЕРРАИН-ИНВАРИАНТНО (фикс 2026-09-03, it272 первого рана): мировая
-    # высота на rough-рельефе читала бугры как ошибку -- kernel замерен
-    # 0.003, терм был мёртвым шумом (флаг №2 ревью base). Root-относительная
-    # форма: высота root над СРЕДНИМ уровнем стоп vs высота клипа над его
-    # землёй (клип ровный, стопы ~0).
+    # История двух неверных форм (2026-09-03, лог TRAINING_STATE):
+    # (1) root_z − env_origins.z: kernel 0.003 -- тайловые origin'ы НЕ
+    #     равны высоте рельефа под роботом, вычитание добавило смещение;
+    # (2) root_z − mean(calf_z): kernel 0.000 -- стоп-тел в артикуляции
+    #     НЕТ (foot merged в calf, origin calf = КОЛЕНО, ~0.25 над землёй).
+    # Правильная минимальная форма -- РОВНО как base_height_l2 всей
+    # v2-v4-линии: СЫРАЯ мировая высота root (рельеф у нас около нуля,
+    # bias на буграх -- тот же принятый bias линии, флаг №2 ревью base).
     cmd: StylePhaseCommand = env.command_manager.get_term(command_name)
     asset: Articulation = env.scene[asset_cfg.name]
-    feet_z = asset.data.body_pos_w[:, cmd.foot_body_ids, 2].mean(dim=1)
-    height = asset.data.root_pos_w[:, 2] - feet_z
-    err = (height - cmd.ref_h()).abs()
+    err = (asset.data.root_pos_w[:, 2] - cmd.ref_h()).abs()
     return torch.exp(-STYLE_SCALE_ROOT_H * err)
 
 
