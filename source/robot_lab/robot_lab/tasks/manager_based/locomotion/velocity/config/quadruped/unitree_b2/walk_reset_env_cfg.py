@@ -224,6 +224,21 @@ class UnitreeB2WalkResetEnvCfg(UnitreeB2RoughEnvCfg):
         self.events.randomize_rigid_body_mass.params["mass_distribution_params"] = (0.7, 1.3)
         self.events.randomize_rigid_body_mass.params["operation"] = "scale"
 
+        # ------Events: v4 -- выравнивание с ЖИВЫМ legged_gym (пакетом, дизайн с base 2026-09-02)------
+        # Развилка v3 показала: экономика (feet_air_time 3.0) сдвигает kernel
+        # 61->72%, но привычку не пробивает -> v4 С НУЛЯ. Пакет = дефолты
+        # живого кода Рудина (концептуально одна переменная "стать живым
+        # кодом"): (1) суставная reset-рандомизация default*uniform(0.5,1.5)
+        # -- у нас был скейл (1.0,1.0), т.е. ВЫКЛ, единственная инверсия
+        # против Рудина; (2) push 1.0 м/с (было 0.5, вдвое слабее Рудина).
+        # Честный минус пакета: при провале не узнаем, какой кусок виноват --
+        # митигация: гейты ловят регрессии по осям раздельно. Известный
+        # остаточный слепой угол scale-рандомизации: hip default=0 -> скейл
+        # его не трогает (у Рудина hip-дефолты ненулевые); если понадобится
+        # -- переход на reset_joints_by_offset отдельным шагом.
+        self.events.randomize_reset_joints.params["position_range"] = (0.5, 1.5)
+        self.events.randomize_push_robot.params["velocity_range"] = {"x": (-1.0, 1.0), "y": (-1.0, 1.0)}
+
         # ------------------------------Curriculum: скоростной, не про gait-phase, оставляем------------------------------
         self.curriculum.command_levels = CurrTerm(
             func=mdp.command_levels_vel,
