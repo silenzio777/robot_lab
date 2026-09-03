@@ -323,6 +323,16 @@ class UnitreeB2StyleTaskEnvCfg(UnitreeB2WalkResetEnvCfg):
             params={"command_name": "style_phase", "asset_cfg": SceneEntityCfg("robot")},
         )
 
+        # ------Events: спавн вертикально (П2 пакета base 2026-09-03)------
+        # rough_env_cfg:58-66 ПОДМЕНЯЕТ params randomize_reset_base целиком:
+        # roll/pitch +-3.14 (спавн вверх ногами -- legged_gym-наследие под
+        # recovery, walk_reset жил с ним ТОЛЬКО потому, что падение не
+        # терминировало). С терминацией это insta-смерть + is_terminated
+        # ни за что на заметной доле ресетов. Recovery -- не цель гибрида.
+        # yaw/z/скорости не трогаем.
+        self.events.randomize_reset_base.params["pose_range"]["roll"] = (-0.3, 0.3)
+        self.events.randomize_reset_base.params["pose_range"]["pitch"] = (-0.3, 0.3)
+
         # ------Terminations: падение = конец эпизода (пакет base 2026-09-03)------
         # Раскладка v7-freeze: joint_pos_limits -98.8/эпизод (54% всей платы)
         # платила УПАВШАЯ туша (у walk_reset падение не терминирует, лежачий
