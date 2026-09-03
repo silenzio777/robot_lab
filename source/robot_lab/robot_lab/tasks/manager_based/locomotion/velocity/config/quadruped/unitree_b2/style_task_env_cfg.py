@@ -165,9 +165,55 @@ class StylePhaseCommand(CommandTerm):
 
         self.phase_time = torch.zeros(self.num_envs, device=self.device)
 
-    def _lookup(self, values: torch.Tensor) -> torch.Tensor:
-        """Линейная интерполяция values (F, ...) по зацикленному phase_time."""
-        t = self.phase_time % self.duration_s
+        # --- Windowed adaptive phase-matching, МОНОТОННАЯ версия (design
+        # train+base, 2026-09-04; v12 без монотонности вырождалось в
+        # топтание внутри окна -- см. GAIT_FIDELITY_PHASE_LOCK история) ---
+        # phase_time остаётся СВОБОДНЫМИ тикающими часами -- источник cos/sin
+        # в observation, НЕ трогаем: нулевой риск для bench-совместимости.
+        # matched_time -- ОТДЕЛЬНАЯ величина, используется ТОЛЬКО reward-
+        # функциями (ref_h/ref_rp/ref_joints ниже читают её, не phase_time).
+        # На каждом шаге: expected = matched_time + step_dt (клип идёт
+        # своим темпом); ищем среди окна кандидатов вокруг expected тот
+        # кадр, что ближе всего к ТЕКУЩЕЙ позе робота (RAW невзвешенная
+        # ошибка -- матчинг и награда не путают роли, per-joint веса
+        # style_joint_pos применяются ОТДЕЛЬНО, уже после).
+        # МОНОТОННОСТЬ (фикс v12-вырождения): offset ограничен СНИЗУ на
+        # -BACK_SLACK_FRAMES*frame_dt (малая слабина назад для естественного
+        # кадр-в-кадр джиттера, не 0 -- жёсткий 0 дал бы новые артефакты на
+        # границе), а не симметрично на -W_FRAMES. Без этого argmin мог
+        # СИСТЕМАТИЧЕСКИ выбирать отрицательный offset (окно самоподобных
+        # кадров), и matched_time топталось на месте сколь угодно долго,
+        # никогда не упираясь в W-край -- v12/it5000: caденс -0.05x вместо
+        # ожидаемых ~1x, при этом style-reward РОС (мерил bench+training-
+        # диагностика независимо, совпало). Зажатие снизу убирает РОВНО ту
+        # степень свободы, что давала патологию, гарантирует cadence >=
+        # ~(1 - BACK_SLACK_FRAMES*frame_dt/step_dt) снизу.
+        # Санити ДО вкрутки (train, standalone, ТРИ случая теперь, третий
+        # закрывает слепое пятно первого захода): клип-сам-себя err=0/
+        # cadence=0.992x; il_slow_walk standalone (kernel 0.756) err_sq~0.16/
+        # cadence~1.056x; СТАТИЧНАЯ поза (не движется вообще) -- err_sq
+        # большой (0.94, честно), cadence 0.388x -- НЕ у нуля (было -0.05x
+        # без монотонности), сигнал "не прогрессирует" виден и по err, и по
+        # caденсу одновременно, деградации в "reward растёт без прогресса"
+        # больше нет.
+        self.matched_time = torch.zeros(self.num_envs, device=self.device)
+        self._window_frames = max(1, round(0.15 * self.duration_s / self.frame_dt))
+        self._back_slack_frames = 2
+        self._window_offsets = (
+            torch.arange(
+                -self._back_slack_frames, self._window_frames + 1, device=self.device, dtype=torch.float32
+            )
+            * self.frame_dt
+        )
+        # Диагностика (НЕ reward): накопительная EMA каденса + доля envs на
+        # границе окна -- поточечный diff шумит и систематически занижает
+        # (memory feedback_cumulative_not_pointwise_cadence.md).
+        self._matched_cadence_ema = torch.ones(self.num_envs, device=self.device)
+        self._window_edge_frac_ema = torch.zeros(self.num_envs, device=self.device)
+
+    def _lookup(self, values: torch.Tensor, t_override: torch.Tensor | None = None) -> torch.Tensor:
+        """Линейная интерполяция values (F, ...) по зацикленному t (по умолчанию phase_time)."""
+        t = (self.phase_time if t_override is None else t_override) % self.duration_s
         frame_f = t / self.frame_dt
         i0 = frame_f.long().clamp(0, self.n_frames - 2)
         alpha = (frame_f - i0.to(frame_f.dtype)).clamp(0.0, 1.0)
@@ -176,15 +222,16 @@ class StylePhaseCommand(CommandTerm):
             return torch.lerp(v0, v1, alpha)
         return torch.lerp(v0, v1, alpha.unsqueeze(-1))
 
-    # --- запросы для reward-термов ---
+    # --- запросы для reward-термов -- ЧЕРЕЗ matched_time (windowed-фаза),
+    # НЕ через свободный phase_time (только observation его использует) ---
     def ref_h(self) -> torch.Tensor:
-        return self._lookup(self.ref_root_h)
+        return self._lookup(self.ref_root_h, self.matched_time)
 
     def ref_rp(self) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._lookup(self.ref_roll), self._lookup(self.ref_pitch)
+        return self._lookup(self.ref_roll, self.matched_time), self._lookup(self.ref_pitch, self.matched_time)
 
     def ref_joints(self) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._lookup(self.ref_joint_pos), self._lookup(self.ref_joint_vel)
+        return self._lookup(self.ref_joint_pos, self.matched_time), self._lookup(self.ref_joint_vel, self.matched_time)
 
     @property
     def command(self) -> torch.Tensor:
@@ -193,6 +240,8 @@ class StylePhaseCommand(CommandTerm):
 
     def _update_metrics(self):
         self.metrics["style_phase_mean"] = (self.phase_time % self.duration_s) / self.duration_s
+        self.metrics["matched_cadence_ratio"] = self._matched_cadence_ema
+        self.metrics["window_edge_fraction"] = self._window_edge_frac_ema
 
     def _resample_command(self, env_ids):
         n = len(env_ids)
@@ -204,6 +253,11 @@ class StylePhaseCommand(CommandTerm):
         # пересадки, см. константу): фаза и поза синхронны по построению.
         start_t = torch.rand(n, device=self.device) * self.duration_s
         self.phase_time[env_ids_t] = start_t
+        # matched_time стартует с ТОГО ЖЕ случайного draw -- один draw на обе
+        # цели (принцип "не выдумывать вторую эвристику", base 2026-09-04).
+        self.matched_time[env_ids_t] = start_t
+        self._matched_cadence_ema[env_ids_t] = 1.0
+        self._window_edge_frac_ema[env_ids_t] = 0.0
 
         tp_mask = torch.rand(n, device=self.device) < STYLE_TELEPORT_FRACTION
         if tp_mask.any():
@@ -226,6 +280,28 @@ class StylePhaseCommand(CommandTerm):
 
     def _update_command(self):
         self.phase_time = self.phase_time + self._env.step_dt
+
+        # Windowed adaptive phase-matching (МОНОТОННАЯ версия -- см. __init__
+        # докстринг): expected -- клип продолжает идти своим темпом, окно
+        # [-BACK_SLACK_FRAMES..+_window_frames] кадров вокруг expected ищет
+        # ближайший по RAW позе кадр.
+        step_dt = self._env.step_dt
+        expected = self.matched_time + step_dt
+        candidate_t = expected.unsqueeze(-1) + self._window_offsets.unsqueeze(0)  # (N, back+W+1)
+        frame_idx = ((candidate_t % self.duration_s) / self.frame_dt).round().long().clamp(0, self.n_frames - 1)
+        candidate_jp = self.ref_joint_pos[frame_idx]  # (N, back+W+1, n_joints)
+        current_jp = self.asset.data.joint_pos[:, self.joint_ids].unsqueeze(1)  # (N, 1, n_joints)
+        err = ((current_jp - candidate_jp) ** 2).sum(dim=-1)  # (N, back+W+1) -- RAW, без per-joint весов
+        best = err.argmin(dim=-1)  # (N,)
+        best_offset = self._window_offsets[best]
+        self.matched_time = expected + best_offset
+
+        # Диагностика (не reward): накопительная EMA каденса + доля envs на
+        # границе окна.
+        inst_cadence = (step_dt + best_offset) / step_dt
+        self._matched_cadence_ema = 0.98 * self._matched_cadence_ema + 0.02 * inst_cadence
+        at_edge = (best_offset >= 0.9 * self._window_frames * self.frame_dt).float()
+        self._window_edge_frac_ema = 0.98 * self._window_edge_frac_ema + 0.02 * at_edge
 
 
 @configclass
