@@ -163,6 +163,44 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     dump_pickle(os.path.join(log_dir, "params", "agent.pkl"), agent_cfg)
 
     # run training
+    # --- ПРОТОКОЛ ЗАЩИТЫ ПЕРЕСАДКИ (train+base 2026-09-03, только при
+    # --- STYLE_FREEZE_ACTOR=1 в окружении; обычные раны не затронуты) ---
+    # Свежий критик + пересаженный актор: шумные advantages разрушают
+    # актора до сходимости критика (v6: телепорт-tilt 10.3->87.2 за 400
+    # ит). Заморозка через requires_grad=False (Л1 base: lr=0 затирается
+    # adaptive-KL планировщиком); на разморозке принудительный сброс lr к
+    # базовому (Л2: за время заморозки KL~0 разгоняет lr до потолка 1e-2).
+    # Критерий разморозки: value_loss < 0.05 стабильно 50 ит, кап 1000.
+    import os as _os
+    if _os.environ.get("STYLE_FREEZE_ACTOR") == "1":
+        _ac = runner.alg.policy if hasattr(runner.alg, "policy") else runner.alg.actor_critic
+        _actor_params = list(_ac.actor.parameters())
+        if hasattr(_ac, "std") and isinstance(_ac.std, torch.nn.Parameter):
+            _actor_params.append(_ac.std)
+        for _p in _actor_params:
+            _p.requires_grad_(False)
+        print(f"[FREEZE] актор заморожен ({sum(p.numel() for p in _actor_params)} параметров), критик-вармап")
+        _orig_update = runner.alg.update
+        _fs = {"frozen": True, "stable": 0, "it": 0}
+
+        def _update_with_freeze():
+            loss = _orig_update()
+            _fs["it"] += 1
+            vl = loss.get("value_function", loss.get("value_loss", 1.0)) if isinstance(loss, dict) else loss[0]
+            if _fs["frozen"]:
+                _fs["stable"] = _fs["stable"] + 1 if vl < 0.05 else 0
+                if _fs["stable"] >= 50 or _fs["it"] >= 1000:
+                    for _p in _actor_params:
+                        _p.requires_grad_(True)
+                    runner.alg.learning_rate = 1.0e-3
+                    for _g in runner.alg.optimizer.param_groups:
+                        _g["lr"] = 1.0e-3
+                    _fs["frozen"] = False
+                    print(f"[FREEZE] РАЗМОРОЗКА на ит {_fs['it']} (value_loss {vl:.4f}, stable {_fs['stable']}), lr сброшен к 1e-3")
+            return loss
+
+        runner.alg.update = _update_with_freeze
+
     runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
 
     # close the simulator

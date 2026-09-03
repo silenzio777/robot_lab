@@ -69,6 +69,15 @@ STYLE_WEIGHT_JOINT_VEL = 0.15
 STYLE_WEIGHT_ROOT_H = 0.3
 STYLE_WEIGHT_ROOT_RP = 0.35
 
+# Протокол защиты пересадки (вердикт base 2026-09-03, v6-разучивание
+# 10.3->87.2 за 400 ит): 50% ресетов -- RSI-телепорт на кадр клипа
+# (ходячий опыт в батче -> критик узнаёт value ходьбы за warmup ->
+# walking-положительные advantages защищают навык после разморозки);
+# другие 50% -- обычный v4-ресет из стойки (учат вход). Фаза и поза --
+# ОДНА переменная внутри _resample_command: рассинхрон часов и кадра
+# невозможен по построению (ловушка Л3 base закрыта конструктивно).
+STYLE_TELEPORT_FRACTION = 0.5
+
 
 class StylePhaseCommand(CommandTerm):
     """Свободные круговые фазовые часы клипа + root-относительный референс.
@@ -93,6 +102,16 @@ class StylePhaseCommand(CommandTerm):
         self.n_frames = frames.shape[0]
         self.frame_dt = float(data["frame_dt"])
         self.duration_s = (self.n_frames - 1) * self.frame_dt
+
+        # Полные кадры -- ТОЛЬКО для 50%-телепорта ресетов (награды стиля
+        # их не видят, стиль остаётся root-относительным без yaw).
+        self._tp_root_pos = frames[:, 0:3]
+        self._tp_root_quat = frames[:, 3:7]
+        tp_lin = torch.zeros_like(self._tp_root_pos)
+        tp_lin[1:-1] = (self._tp_root_pos[2:] - self._tp_root_pos[:-2]) / (2 * self.frame_dt)
+        tp_lin[0] = (self._tp_root_pos[1] - self._tp_root_pos[0]) / self.frame_dt
+        tp_lin[-1] = (self._tp_root_pos[-1] - self._tp_root_pos[-2]) / self.frame_dt
+        self._tp_root_lin_vel = tp_lin
 
         # root-относительные величины: высота, roll/pitch (из кватерниона,
         # yaw отброшен), суставы. Мировые x/y и yaw НЕ сохраняем вовсе.
@@ -156,9 +175,30 @@ class StylePhaseCommand(CommandTerm):
         if n == 0:
             return
         env_ids_t = torch.as_tensor(env_ids, device=self.device)
-        # случайная стартовая фаза -- НЕ телепортируем робота (ресет
-        # остаётся v4-пакетным), политика учится ВХОДИТЬ в цикл сама.
-        self.phase_time[env_ids_t] = torch.rand(n, device=self.device) * self.duration_s
+        # случайная стартовая фаза для ВСЕХ; для STYLE_TELEPORT_FRACTION
+        # сред -- ещё и RSI-телепорт на кадр ЭТОЙ ЖЕ фазы (протокол защиты
+        # пересадки, см. константу): фаза и поза синхронны по построению.
+        start_t = torch.rand(n, device=self.device) * self.duration_s
+        self.phase_time[env_ids_t] = start_t
+
+        tp_mask = torch.rand(n, device=self.device) < STYLE_TELEPORT_FRACTION
+        if tp_mask.any():
+            tp_ids = env_ids_t[tp_mask]
+            t = start_t[tp_mask]
+            frame_f = t / self.frame_dt
+            i0 = frame_f.long().clamp(0, self.n_frames - 2)
+            alpha = (frame_f - i0.to(frame_f.dtype)).clamp(0.0, 1.0).unsqueeze(-1)
+            root_pos = torch.lerp(self._tp_root_pos[i0], self._tp_root_pos[i0 + 1], alpha)
+            root_quat = self._tp_root_quat[i0]  # nearest -- как проверенный RSI imitation
+            jp = torch.lerp(self.ref_joint_pos[i0], self.ref_joint_pos[i0 + 1], alpha)
+            jv = torch.lerp(self.ref_joint_vel[i0], self.ref_joint_vel[i0 + 1], alpha)
+            lin = torch.lerp(self._tp_root_lin_vel[i0], self._tp_root_lin_vel[i0 + 1], alpha)
+
+            root_pos_world = root_pos + self._env.scene.env_origins[tp_ids]
+            self.asset.write_root_pose_to_sim(torch.cat([root_pos_world, root_quat], dim=-1), env_ids=tp_ids)
+            root_vel = torch.cat([lin, torch.zeros_like(lin)], dim=-1)
+            self.asset.write_root_velocity_to_sim(root_vel, env_ids=tp_ids)
+            self.asset.write_joint_state_to_sim(jp, jv, joint_ids=self.joint_ids, env_ids=tp_ids)
 
     def _update_command(self):
         self.phase_time = self.phase_time + self._env.step_dt
