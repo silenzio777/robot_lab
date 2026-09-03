@@ -174,6 +174,23 @@ class StylePhaseCommandCfg(CommandTermCfg):
 
 
 # --- style reward-термы (все exp-kernel, root-относительные, без yaw) ---
+#
+# ГЕЙТ ПО КОМАНДЕ (v5, вердикт base 2026-09-03 после трёх нулевых проб
+# гибрида v4): безусловный положительный стиль оказался СУБСИДИЕЙ
+# ВЫЖИВАНИЯ-КОНСЕРВАТИЗМА (патология survival bonus, семья v1-крауча --
+# только статуя в полный рост: base_height доволен, стиль капает).
+# Гейт СТРОГО по КОМАНДЕ (|cmd| >= 0.1), НЕ по фактическому движению --
+# команду нельзя эксплуатировать, движение можно ('вибрация' ради
+# выплаты). Семантика: cmd~0 -> стиль РОВНО 0 (субсидии нет); cmd>0 ->
+# любой шаг платит style>0 против нуля стойки -- градиент про-шаговый
+# ('стиль наказывает первые шаги' инвертируется). Веса 1.8 НЕ тронуты --
+# одна переменная.
+
+
+def _style_gate(env, command_name_vel: str = "base_velocity") -> torch.Tensor:
+    cmd = env.command_manager.get_term(command_name_vel).command
+    return (torch.norm(cmd[:, :3], dim=-1) >= 0.1).float()
+
 
 
 def style_joint_pos(env, command_name: str, asset_cfg: SceneEntityCfg) -> torch.Tensor:
@@ -181,7 +198,7 @@ def style_joint_pos(env, command_name: str, asset_cfg: SceneEntityCfg) -> torch.
     asset: Articulation = env.scene[asset_cfg.name]
     ref_jp, _ = cmd.ref_joints()
     err_sq = ((asset.data.joint_pos[:, cmd.joint_ids] - ref_jp) ** 2).sum(dim=-1)
-    return torch.exp(-STYLE_SCALE_JOINT_POS * err_sq)
+    return _style_gate(env) * torch.exp(-STYLE_SCALE_JOINT_POS * err_sq)
 
 
 def style_joint_vel(env, command_name: str, asset_cfg: SceneEntityCfg) -> torch.Tensor:
@@ -189,7 +206,7 @@ def style_joint_vel(env, command_name: str, asset_cfg: SceneEntityCfg) -> torch.
     asset: Articulation = env.scene[asset_cfg.name]
     _, ref_jv = cmd.ref_joints()
     err_sq = ((asset.data.joint_vel[:, cmd.joint_ids] - ref_jv) ** 2).sum(dim=-1)
-    return torch.exp(-STYLE_SCALE_JOINT_VEL * err_sq)
+    return _style_gate(env) * torch.exp(-STYLE_SCALE_JOINT_VEL * err_sq)
 
 
 def style_root_h(env, command_name: str, asset_cfg: SceneEntityCfg) -> torch.Tensor:
@@ -204,7 +221,7 @@ def style_root_h(env, command_name: str, asset_cfg: SceneEntityCfg) -> torch.Ten
     cmd: StylePhaseCommand = env.command_manager.get_term(command_name)
     asset: Articulation = env.scene[asset_cfg.name]
     err = (asset.data.root_pos_w[:, 2] - cmd.ref_h()).abs()
-    return torch.exp(-STYLE_SCALE_ROOT_H * err)
+    return _style_gate(env) * torch.exp(-STYLE_SCALE_ROOT_H * err)
 
 
 def style_root_rp(env, command_name: str, asset_cfg: SceneEntityCfg) -> torch.Tensor:
@@ -216,7 +233,7 @@ def style_root_rp(env, command_name: str, asset_cfg: SceneEntityCfg) -> torch.Te
     pitch = torch.asin(torch.clamp(2 * (w * y - z * x), -1.0, 1.0))
     ref_roll, ref_pitch = cmd.ref_rp()
     err = (roll - ref_roll).abs() + (pitch - ref_pitch).abs()
-    return torch.exp(-STYLE_SCALE_ROOT_RP * err)
+    return _style_gate(env) * torch.exp(-STYLE_SCALE_ROOT_RP * err)
 
 
 @configclass
