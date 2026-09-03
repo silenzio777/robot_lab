@@ -170,7 +170,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # ит). Заморозка через requires_grad=False (Л1 base: lr=0 затирается
     # adaptive-KL планировщиком); на разморозке принудительный сброс lr к
     # базовому (Л2: за время заморозки KL~0 разгоняет lr до потолка 1e-2).
-    # Критерий разморозки: value_loss < 0.05 стабильно 50 ит, кап 1000.
+    # Критерий разморозки: explained_variance > 0.7 стабильно 50 ит, кап
+    # 1000 (протокол обновлён base 2026-09-03: абсолютный value_loss<0.05
+    # был откалиброван под нормальную шкалу reward и недостижим при |R|~200;
+    # ev безразмерен: 1 - Var(return-value)/Var(return) на батче storage,
+    # считается ДО update -- после него storage очищается).
     import os as _os
     if _os.environ.get("STYLE_FREEZE_ACTOR") == "1":
         _ac = runner.alg.policy if hasattr(runner.alg, "policy") else runner.alg.actor_critic
@@ -184,11 +188,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         _fs = {"frozen": True, "stable": 0, "it": 0}
 
         def _update_with_freeze():
+            _ev = 0.0
+            _st = getattr(runner.alg, "storage", None)
+            if _st is not None and getattr(_st, "returns", None) is not None:
+                _ret = _st.returns.flatten()
+                _var = torch.var(_ret)
+                if _var > 1e-8:
+                    _ev = float(1.0 - torch.var(_ret - _st.values.flatten()) / _var)
             loss = _orig_update()
             _fs["it"] += 1
             vl = loss.get("value_function", loss.get("value_loss", 1.0)) if isinstance(loss, dict) else loss[0]
             if _fs["frozen"]:
-                _fs["stable"] = _fs["stable"] + 1 if vl < 0.05 else 0
+                _fs["stable"] = _fs["stable"] + 1 if _ev > 0.7 else 0
+                if _fs["it"] % 100 == 0:
+                    print(f"[FREEZE] ит {_fs['it']}: explained_variance {_ev:.3f}, stable {_fs['stable']}")
                 if _fs["stable"] >= 50 or _fs["it"] >= 1000:
                     for _p in _actor_params:
                         _p.requires_grad_(True)
@@ -196,7 +209,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     for _g in runner.alg.optimizer.param_groups:
                         _g["lr"] = 1.0e-3
                     _fs["frozen"] = False
-                    print(f"[FREEZE] РАЗМОРОЗКА на ит {_fs['it']} (value_loss {vl:.4f}, stable {_fs['stable']}), lr сброшен к 1e-3")
+                    print(f"[FREEZE] РАЗМОРОЗКА на ит {_fs['it']} (explained_variance {_ev:.3f}, value_loss {vl:.4f}, stable {_fs['stable']}), lr сброшен к 1e-3")
             return loss
 
         runner.alg.update = _update_with_freeze

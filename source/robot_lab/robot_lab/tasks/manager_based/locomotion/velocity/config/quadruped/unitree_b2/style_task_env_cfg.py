@@ -46,6 +46,7 @@ from isaaclab.assets import Articulation
 from isaaclab.managers import CommandTerm, CommandTermCfg, ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils import configclass
 
 import robot_lab.tasks.manager_based.locomotion.velocity.mdp as mdp
@@ -321,6 +322,28 @@ class UnitreeB2StyleTaskEnvCfg(UnitreeB2WalkResetEnvCfg):
             func=style_root_rp, weight=STYLE_WEIGHT_ROOT_RP,
             params={"command_name": "style_phase", "asset_cfg": SceneEntityCfg("robot")},
         )
+
+        # ------Terminations: падение = конец эпизода (пакет base 2026-09-03)------
+        # Раскладка v7-freeze: joint_pos_limits -98.8/эпизод (54% всей платы)
+        # платила УПАВШАЯ туша (у walk_reset падение не терминирует, лежачий
+        # хвост со смятыми в лимиты суставами живёт до конца 20с эпизода) --
+        # критик честно предпочёл «лечь сразу» (-11 против -181 у ходьбы).
+        # В родителе illegal_contact=None -- params не пропатчить, строим
+        # DoneTerm заново (стоковая строка rough_env_cfg:153).
+        self.terminations.illegal_contact = DoneTerm(
+            func=mdp.illegal_contact,
+            params={
+                "sensor_cfg": SceneEntityCfg(
+                    "contact_forces", body_names=[self.base_link_name, ".*_hip"]
+                ),
+                "threshold": 1.0,
+            },
+        )
+        # Страховка от суицид-эксплойта: по-шаговый поток при плохой походке
+        # отрицательный, «нырнуть и сдохнуть» обрывал бы его выгодно. Разовый
+        # штраф порядка секунд лежания. Сигнатура суицида для мониторинга:
+        # ep_len схлопывается при растущем reward -> штраф вверх.
+        self.rewards.is_terminated.weight = -10.0
 
         # Зачистка нулевых термов ОБЯЗАТЕЛЬНА и именно здесь: в родителях
         # она под гвардом `__class__.__name__ == "...WalkResetEnvCfg"` --
