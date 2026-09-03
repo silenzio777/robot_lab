@@ -133,6 +133,22 @@ class StylePhaseCommand(CommandTerm):
         assert found == data["joint_order"]
         self.joint_ids = joint_ids
 
+        # Per-сустав вес err_sq в style_joint_pos (base's вердикт 2026-09-03,
+        # v8 gait-fidelity находка): ЖИВОЙ бенч-замер на текущем чекпоинте
+        # (thigh ROM 47-53% клипа, calf 94-132% -- ROM-доля, НЕ доля в сыром
+        # err_sq, которая вводит в заблуждение по масштабу суставов, тот же
+        # класс ошибки, что joint_acc_l2) показал: PPO дёшево сжал thigh
+        # (дорогой маховый сустав) -> частота шага уехала 3.10x от клока
+        # клипа (zero-crossing замер) -> ЛЮБОЙ сустав рассинхронизирован по
+        # фазе. ОДНА переменная (принцип): только thigh x2, hip/calf НЕ
+        # трогаем -- если механизм верен, calf сам придёт в норму как
+        # побочный эффект восстановленного каденса (проверяемый критерий,
+        # не измененный вручную).
+        self.joint_pos_weights = torch.tensor(
+            [2.0 if "thigh" in n else 1.0 for n in data["joint_order"]],
+            dtype=torch.float32, device=self.device,
+        )
+
         # Стопы (calf-прокси, как во всём репо) -- для терраин-инвариантной
         # высоты style_root_h (см. функцию: root_z − mean(feet_z)).
         foot_names = ["FR_calf", "FL_calf", "RR_calf", "RL_calf"]
@@ -238,7 +254,7 @@ def style_joint_pos(env, command_name: str, asset_cfg: SceneEntityCfg) -> torch.
     cmd: StylePhaseCommand = env.command_manager.get_term(command_name)
     asset: Articulation = env.scene[asset_cfg.name]
     ref_jp, _ = cmd.ref_joints()
-    err_sq = ((asset.data.joint_pos[:, cmd.joint_ids] - ref_jp) ** 2).sum(dim=-1)
+    err_sq = (((asset.data.joint_pos[:, cmd.joint_ids] - ref_jp) ** 2) * cmd.joint_pos_weights).sum(dim=-1)
     return _style_gate(env) * torch.exp(-STYLE_SCALE_JOINT_POS * err_sq)
 
 
