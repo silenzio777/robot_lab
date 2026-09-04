@@ -87,6 +87,24 @@ STYLE_TROT_WINDOW_TEMPO_SCALE = STYLE_TROT_TARGET_OPERATING_SPEED / STYLE_TROT_C
 # термы остаются с прежним гейтом >=0.1 -- НЕ тронуты этим шагом.
 STYLE_TROT_GATE_MIN_CMD = 0.7
 
+# Per-joint веса -- ПРИМЕНЕНО 2026-09-04 в it11900 (resume, не restart), не
+# дожидаясь диагностического окна it12500-13000: три сходящихся сигнала на
+# uniform-старте (см. докстринг класса, раздел "предсказание") --
+# (1) Metrics/style_trot_phase/matched_cadence_ratio устойчиво уполз
+# 0.95x->1.6x+ за ~400 ит при низком window_edge_fraction (не пиннинг окна,
+# реальная динамика); (2) ВИЗУАЛЬНО (render_style_walk.py, кадры глазами) --
+# при vx=1.0 steady-state лапы сжаты под корпусом, минимальный размах, в
+# отличие от vx=0.5 (только slow-walk, широкий уверенный шаг) -- ровно
+# base'ова гипотеза "мелкие трот-образные шаги вместо честного покрытия
+# дистанции"; (3) предсказание по var клипа (thigh:calf=0.54x) уже
+# указывало на недокоррекцию thigh. Числа точности скорости (vx-probe) при
+# этом были формально "ok" -- методологический урок: bench-числа могут
+# пройти пороги и всё равно скрывать нездоровый паттерн, глазами смотреть
+# ОБЯЗАТЕЛЬНО, не только по метрикам.
+# Веса ∝ 1/var(клип rescale15): var_hip=0.00686, var_thigh=0.09613,
+# var_calf=0.05176 rad² -> нормировано на calf=1.0.
+STYLE_TROT_JOINT_WEIGHT_MULTIPLIERS = {"thigh": 1.85, "hip": 7.55}
+
 # --- шкалы -- те же порядки величины, что у slow-walk (design intent:
 # style-сумма ~40% от task-суммы, тот же коридор, см. докстринг
 # style_task_env_cfg.py) -- ПЕРВЫЙ прогон, не финальная калибровка ---
@@ -150,7 +168,7 @@ class UnitreeB2StyleTaskTrotEnvCfg(UnitreeB2StyleTaskEnvCfg):
             motion_json_path=STYLE_TROT_MOTION_JSON,
             window_tempo_scale=STYLE_TROT_WINDOW_TEMPO_SCALE,
             enable_rsi_teleport=False,
-            joint_pos_weight_multipliers={},  # UNIFORM старт (design: измерить прежде чем весить)
+            joint_pos_weight_multipliers=STYLE_TROT_JOINT_WEIGHT_MULTIPLIERS,
         )
         # НЕ добавляем в observations -- обучение видит те же 47 obs, что
         # v14 (обратная совместимость bench/onnx, sidecar не меняется).
