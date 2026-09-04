@@ -151,8 +151,13 @@ class StylePhaseCommand(CommandTerm):
         # ухудшил (мог случайно попасть в область, где task-градиент
         # доминирует достаточно), hip x2 отменён -- ROM на нём УХУДШИЛСЯ
         # (RR 174%->250%), подтверждая формулу.
+        # per-joint множитель НАСТРАИВАЕМ через cfg (walk->trot шаг,
+        # 2026-09-04): thigh x2 калиброван ИМЕННО под slow-walk клип,
+        # ошибочно было бы жёстко зашить его для любого инстанса --
+        # trot-инстанс того же класса стартует UNIFORM (см. cfg default).
+        mult = dict(self.cfg.joint_pos_weight_multipliers)
         self.joint_pos_weights = torch.tensor(
-            [2.0 if "thigh" in n else 1.0 for n in data["joint_order"]],
+            [next((v for k, v in mult.items() if k in n), 1.0) for n in data["joint_order"]],
             dtype=torch.float32, device=self.device,
         )
 
@@ -259,6 +264,8 @@ class StylePhaseCommand(CommandTerm):
         self._matched_cadence_ema[env_ids_t] = 1.0
         self._window_edge_frac_ema[env_ids_t] = 0.0
 
+        if not self.cfg.enable_rsi_teleport:
+            return
         tp_mask = torch.rand(n, device=self.device) < STYLE_TELEPORT_FRACTION
         if tp_mask.any():
             tp_ids = env_ids_t[tp_mask]
@@ -286,7 +293,7 @@ class StylePhaseCommand(CommandTerm):
         # [-BACK_SLACK_FRAMES..+_window_frames] кадров вокруг expected ищет
         # ближайший по RAW позе кадр.
         step_dt = self._env.step_dt
-        expected = self.matched_time + step_dt
+        expected = self.matched_time + step_dt * self.cfg.window_tempo_scale
         candidate_t = expected.unsqueeze(-1) + self._window_offsets.unsqueeze(0)  # (N, back+W+1)
         frame_idx = ((candidate_t % self.duration_s) / self.frame_dt).round().long().clamp(0, self.n_frames - 1)
         candidate_jp = self.ref_joint_pos[frame_idx]  # (N, back+W+1, n_joints)
@@ -311,6 +318,34 @@ class StylePhaseCommandCfg(CommandTermCfg):
     resampling_time_range: tuple[float, float] = (1.0e6, 1.0e6)
     asset_name: str = "robot"
     debug_vis: bool = False
+    # Развязка темпа windowed-окна от записанного frame_dt клипа (design
+    # train+base, 2026-09-04, walk->trot шаг): expected = matched_time_prev +
+    # step_dt*window_tempo_scale вместо implicit chase-at-1x. Нужно, когда
+    # клип быстрее реальной рабочей скорости робота (напр. rescale-клип
+    # рыси "подразумевает" 1.5 м/с, а команда джойстика максимум ~1.0) --
+    # без развязки monotonic-clamp хронически упирался бы в нижний край
+    # КАЖДЫЙ шаг (не изредка, как задуман джиттер), а не иногда. Форма позы
+    # (какие суставы куда, диагональная фазировка) НЕ трогается -- только
+    # скорость, с которой окно ищет по клипу. По умолчанию 1.0 (текущее
+    # поведение slow-walk клипа, где записанный темп клипа = рабочая
+    # скорость, не трогать).
+    window_tempo_scale: float = 1.0
+    # Владелец RSI-телепорта на ресете (walk->trot шаг, design 2026-09-04):
+    # ДВА параллельных StylePhaseCommand-инстанса (slow-walk + trot) НЕ
+    # могут независимо телепортировать asset на _resample_command -- оба
+    # пишут root_pose/joint_state напрямую, второй перезапишет первый,
+    # "фаза и поза -- одна переменная" сломается для проигравшего. Только
+    # ОДИН инстанс (slow-walk, как в v14) владеет телепортом; trot-инстанс
+    # ставит False -- трекает matched_time по фактической позе робота
+    # (какую бы её ни поставил slow-walk-телепорт или предыдущий шаг),
+    # ничего сам не пишет в sim.
+    enable_rsi_teleport: bool = True
+    # per-joint множитель err_sq в style_joint_pos, по подстроке имени
+    # сустава (напр. {"thigh": 2.0}). По умолчанию -- ТЕКУЩЕЕ поведение
+    # slow-walk v14 (thigh x2, найден эмпирически, см. TRAINING_STATE
+    # 2026-09-03/04). Новые инстансы (напр. trot) ставят {} -- честный
+    # uniform старт, не переиспользуют slow-walk-специфичный множитель.
+    joint_pos_weight_multipliers: dict[str, float] = {"thigh": 2.0}
 
 
 # --- style reward-термы (все exp-kernel, root-относительные, без yaw) ---
@@ -327,9 +362,9 @@ class StylePhaseCommandCfg(CommandTermCfg):
 # одна переменная.
 
 
-def _style_gate(env, command_name_vel: str = "base_velocity") -> torch.Tensor:
+def _style_gate(env, command_name_vel: str = "base_velocity", min_cmd: float = 0.1) -> torch.Tensor:
     cmd = env.command_manager.get_term(command_name_vel).command
-    return (torch.norm(cmd[:, :3], dim=-1) >= 0.1).float()
+    return (torch.norm(cmd[:, :3], dim=-1) >= min_cmd).float()
 
 
 

@@ -207,3 +207,18 @@ gym.register(
         "cusrl_cfg_entry_point": f"{agents.__name__}.cusrl_ppo_cfg:UnitreeB2RoughTrainerCfg",
     },
 )
+
+gym.register(
+    # Style+Task гибрид, ШАГ 2 (2026-09-04): v14 (медленный шаг,
+    # confirmed_skills/hybrid_style_walk_v14) + ВТОРОЙ style-термин от
+    # rescale15-клипа рыси, активный только на |cmd|>=0.7 -- см.
+    # style_task_trot_env_cfg.py докстринг для полного дизайна.
+    id="RobotLab-Isaac-Velocity-Rough-Unitree-B2-StyleTaskTrot-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.style_task_trot_env_cfg:UnitreeB2StyleTaskTrotEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeB2StyleTaskPPORunnerCfg",
+        "cusrl_cfg_entry_point": f"{agents.__name__}.cusrl_ppo_cfg:UnitreeB2RoughTrainerCfg",
+    },
+)
