@@ -304,8 +304,12 @@ class StylePhaseCommand(CommandTerm):
         self.matched_time = expected + best_offset
 
         # Диагностика (не reward): накопительная EMA каденса + доля envs на
-        # границе окна.
-        inst_cadence = (step_dt + best_offset) / step_dt
+        # границе окна. ВАЖНО: база -- это step_dt*window_tempo_scale (то,
+        # что реально прибавляет expected), а не голый step_dt -- иначе для
+        # tempo_scale!=1 число систематически завышено на константу
+        # (1-tempo_scale) относительно истинного pace (найдено 2026-09-04
+        # при разборе роста matched_cadence_ratio у trot-трекера).
+        inst_cadence = (step_dt * self.cfg.window_tempo_scale + best_offset) / step_dt
         self._matched_cadence_ema = 0.98 * self._matched_cadence_ema + 0.02 * inst_cadence
         at_edge = (best_offset >= 0.9 * self._window_frames * self.frame_dt).float()
         self._window_edge_frac_ema = 0.98 * self._window_edge_frac_ema + 0.02 * at_edge
