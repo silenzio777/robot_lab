@@ -175,5 +175,10 @@ class UnitreeB2StyleTaskTrotEnvCfg(UnitreeB2StyleTaskEnvCfg):
             func=style_trot_root_rp, weight=STYLE_TROT_WEIGHT_ROOT_RP,
             params={"command_name": "style_trot_phase", "asset_cfg": SceneEntityCfg("robot")},
         )
-
-        self.disable_zero_weight_rewards()
+        # НЕ вызываем disable_zero_weight_rewards() снова -- родитель
+        # (UnitreeB2StyleTaskEnvCfg.__post_init__) уже вызвал его в конце
+        # super().__post_init__(), повторный вызов падает на уже
+        # обнулённых (None) термах предыдущего прохода (AttributeError:
+        # 'NoneType' object has no attribute 'weight' -- поймано на первом
+        # запуске). Новые style_trot_* термы все с ненулевым весом, им
+        # это и не требовалось.
