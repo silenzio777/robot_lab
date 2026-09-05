@@ -163,6 +163,25 @@ class UnitreeB2StyleTaskTrotEnvCfg(UnitreeB2StyleTaskEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
+        # ------Commands: потолок скорости поднят до родного темпа trot-клипа------
+        # (2026-09-05, хозяин: "ради этого всё затевалось" -- на 1.0 м/с
+        # рысь физически негде раскрыться). trot-клип rescale15
+        # "подразумевает" 1.494 м/с (замерено напрямую, см. докстринг
+        # STYLE_TROT_CLIP_NATIVE_SPEED выше) -- потолок 1.0 структурно
+        # зажимал шаг в компактную/семенящую форму именно у верхней
+        # границы команд (bench-подтверждено: vx=0.8->1.02 перебег +27%,
+        # vx=1.0->1.19 перебег +19%, визуально сжатая стойка на vx=1.0 vs
+        # уверенный широкий шаг на vx=0.5 -- TRAINING_STATE.md ~15:25).
+        # СКОУП только trot-линия (не walk_reset/style_task(v14) родитель)
+        # -- design train+base: не трогать уже стабильные сегодня линии.
+        # window_tempo_scale (0.669) и STYLE_TROT_GATE_MIN_CMD (0.7) --
+        # НЕ меняем в этом запуске (base: "одна структурная переменная за
+        # раз", тот же принцип, что вчера с heading). Следующий шаг, если
+        # window_edge_fraction вырастет СПЕЦИФИЧНО на vx>1.2 (не агрегатом
+        # по всем командам) -- сделать tempo_scale пропорциональным
+        # текущей команде вместо константы.
+        self.commands.base_velocity.ranges.lin_vel_x = (-1.5, 1.5)
+
         # ------Commands: второй трекер, БЕЗ телепорта (владеет slow-walk)------
         self.commands.style_trot_phase = StylePhaseCommandCfg(
             motion_json_path=STYLE_TROT_MOTION_JSON,
